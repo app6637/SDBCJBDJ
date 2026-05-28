@@ -1,0 +1,3853 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TERRAZA LOS CADENAS – Sistema POS</title>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Barlow:wght@300;400;500;600;700&family=Barlow+Condensed:wght@400;600;700&family=Roboto+Mono:wght@400;700&display=swap" rel="stylesheet">
+
+<!-- ══ FIREBASE SDK ══ -->
+<script type="module">
+  import { initializeApp }          from "https://www.gstatic.com/firebasejs/11.8.1/firebase-app.js";
+  import { getAnalytics, logEvent } from "https://www.gstatic.com/firebasejs/11.8.1/firebase-analytics.js";
+  import {
+    getFirestore, doc, setDoc, getDoc, onSnapshot, serverTimestamp
+  } from "https://www.gstatic.com/firebasejs/11.8.1/firebase-firestore.js";
+
+  // ── Configuración ──────────────────────────────────────────
+  const firebaseConfig = {
+    apiKey:            "AIzaSyCSfonZwGgiKTXDssP953JTWHJQ1R34w3U",
+    authDomain:        "laterraza2-4016e.firebaseapp.com",
+    projectId:         "laterraza2-4016e",
+    storageBucket:     "laterraza2-4016e.firebasestorage.app",
+    messagingSenderId: "1045485832179",
+    appId:             "1:1045485832179:web:152b9f8aeff150c2d0f486",
+    measurementId:     "G-5JR673ND6R"
+  };
+
+  const fbApp     = initializeApp(firebaseConfig);
+  const analytics = getAnalytics(fbApp);
+  const db        = getFirestore(fbApp);
+
+  // ── Documentos Firestore ──────────────────────────────────
+  // pos/terraza      → estado general (pedidos, meseros, clientes, gastos, recaudos)
+  // pos/inventory    → inventario SEPARADO para sync rápida e independiente
+  // pos/currentOrder → pedido activo
+  const STATE_DOC   = doc(db, "pos", "terraza");
+  const INV_DOC     = doc(db, "pos", "inventory");
+  const ORDER_DOC   = doc(db, "pos", "currentOrder");
+
+  // ── Banderas anti-bucle ────────────────────────────────────
+  // Separadas por colección para no bloquear unas a otras
+  let _writingState = false;
+  let _writingInv   = false;
+  let _writingOrder = false;
+
+  // ── Helpers de imagen ─────────────────────────────────────
+  function stripImgs(inventory) {
+    return (inventory || []).map(i => ({ ...i, img: i.img ? '__IMG__' : null }));
+  }
+  function restoreImgs(fbInventory) {
+    const local = (() => { try { return JSON.parse(localStorage.getItem('posState')); } catch { return null; } })();
+    const localInv = local ? (local.inventory || []) : [];
+    return (fbInventory || []).map(fi => {
+      if (fi.img === '__IMG__') {
+        const li = localInv.find(i => i.id === fi.id);
+        return { ...fi, img: li ? li.img : null };
+      }
+      return fi;
+    });
+  }
+
+  // ══════════════════════════════════════════════
+  // GUARDAR
+  // ══════════════════════════════════════════════
+
+  // Guarda SOLO el inventario (stock, precios, orden, productos nuevos/eliminados)
+  async function fbSaveInventory(inventory) {
+    if (_writingInv) return;
+    _writingInv = true;
+    try {
+      await setDoc(INV_DOC, {
+        items: stripImgs(inventory),
+        _updatedAt: serverTimestamp()
+      });
+    } catch (e) { console.warn('[Firebase] Error guardando inventario:', e); }
+    finally { _writingInv = false; }
+  }
+
+  // Guarda el estado general SIN inventario (pedidos, meseros, clientes…)
+  async function fbSaveState(stateObj, currentOrderObj) {
+    if (_writingState) return;
+    _writingState = true;
+    try {
+      const { inventory, ...stateWithoutInv } = stateObj;
+      await setDoc(STATE_DOC, { ...stateWithoutInv, _updatedAt: serverTimestamp() });
+    } catch (e) { console.warn('[Firebase] Error guardando estado:', e); }
+    finally { _writingState = false; }
+
+    // Guardar pedido activo
+    if (_writingOrder) return;
+    _writingOrder = true;
+    try {
+      await setDoc(ORDER_DOC, { ...(currentOrderObj || {}), _updatedAt: serverTimestamp() });
+    } catch (e) { console.warn('[Firebase] Error guardando pedido:', e); }
+    finally { _writingOrder = false; }
+  }
+
+  // ══════════════════════════════════════════════
+  // CARGAR (primera vez)
+  // ══════════════════════════════════════════════
+  async function fbLoadInventory() {
+    try {
+      const snap = await getDoc(INV_DOC);
+      if (!snap.exists()) return null;
+      const data = snap.data();
+      return restoreImgs(data.items || []);
+    } catch (e) { console.warn('[Firebase] Error cargando inventario:', e); return null; }
+  }
+
+  async function fbLoadState() {
+    try {
+      const snap = await getDoc(STATE_DOC);
+      if (!snap.exists()) return null;
+      const data = snap.data();
+      delete data._updatedAt;
+      return data;
+    } catch (e) { console.warn('[Firebase] Error cargando estado:', e); return null; }
+  }
+
+  async function fbLoadCurrentOrder() {
+    try {
+      const snap = await getDoc(ORDER_DOC);
+      if (!snap.exists()) return null;
+      const data = snap.data();
+      delete data._updatedAt;
+      return data;
+    } catch (e) { console.warn('[Firebase] Error cargando pedido:', e); return null; }
+  }
+
+  // ══════════════════════════════════════════════
+  // ESCUCHA EN TIEMPO REAL
+  // ══════════════════════════════════════════════
+  let _unsubInv   = null;
+  let _unsubState = null;
+  let _unsubOrder = null;
+
+  function fbStartRealtime() {
+    // ── Inventario: sync INMEDIATA en cada cambio ──────────
+    if (_unsubInv) _unsubInv();
+    _unsubInv = onSnapshot(INV_DOC, snap => {
+      if (!snap.exists() || _writingInv) return;
+      const data = snap.data();
+      if (!data || !data.items) return;
+      const items = restoreImgs(data.items);
+      if (typeof window._posApplyInventory === 'function') {
+        window._posApplyInventory(items);
+      }
+    }, err => console.warn('[Firebase] onSnapshot inventario:', err));
+
+    // ── Estado general ─────────────────────────────────────
+    if (_unsubState) _unsubState();
+    _unsubState = onSnapshot(STATE_DOC, snap => {
+      if (!snap.exists() || _writingState) return;
+      const data = snap.data();
+      delete data._updatedAt;
+      if (!data) return;
+      if (typeof window._posApplyState === 'function') {
+        window._posApplyState(data);
+      }
+    }, err => console.warn('[Firebase] onSnapshot estado:', err));
+
+    // ── Pedido activo ──────────────────────────────────────
+    if (_unsubOrder) _unsubOrder();
+    _unsubOrder = onSnapshot(ORDER_DOC, snap => {
+      if (!snap.exists() || _writingOrder) return;
+      const data = snap.data();
+      delete data._updatedAt;
+      if (data && typeof window._posApplyCurrentOrder === 'function') {
+        window._posApplyCurrentOrder(data);
+      }
+    }, err => console.warn('[Firebase] onSnapshot pedido:', err));
+  }
+
+  // ── Analytics ─────────────────────────────────────────────
+  function fbLogEvent(name, params) {
+    try { logEvent(analytics, name, params || {}); } catch {}
+  }
+
+  // ── API pública ───────────────────────────────────────────
+  window._firebase = {
+    saveInventory:    fbSaveInventory,
+    saveState:        fbSaveState,
+    loadInventory:    fbLoadInventory,
+    loadState:        fbLoadState,
+    loadCurrentOrder: fbLoadCurrentOrder,
+    startRealtime:    fbStartRealtime,
+    logEvent:         fbLogEvent,
+    ready:            false
+  };
+
+  window.addEventListener('DOMContentLoaded', () => {
+    window._firebase.ready = true;
+    const el = document.getElementById('fbStatusIndicator');
+    if (el) { el.textContent = '🔥 Firebase'; el.style.color = '#F5A623'; }
+  });
+</script>
+<!-- ══ FIN FIREBASE SDK ══ -->
+
+
+
+<style>
+:root {
+  --gold: #D4A843;
+  --gold-light: #F0C96A;
+  --dark: #0D0D0D;
+  --dark2: #161616;
+  --dark3: #1E1E1E;
+  --dark4: #252525;
+  --dark5: #2E2E2E;
+  --text: #E8E8E8;
+  --text-muted: #888;
+  --red: #C0392B;
+  --green: #27AE60;
+  --blue: #2980B9;
+  --border: rgba(212,168,67,0.2);
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Barlow', sans-serif; background: var(--dark); color: var(--text); min-height: 100vh; overflow: auto; }
+
+/* ── LOCK / STARTUP SCREEN ── */
+#lockScreen {
+  position: fixed; inset: 0; background: var(--dark);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  z-index: 9999;
+}
+#lockScreen h1 { font-family: 'Bebas Neue', sans-serif; font-size: 3.6rem; color: var(--gold); letter-spacing: 4px; }
+#lockScreen .sub { color: var(--text-muted); margin: 6px 0 28px; font-size: 1rem; letter-spacing: 2px; }
+.lock-card {
+  background: var(--dark3); border: 1px solid var(--border); border-radius: 10px;
+  padding: 28px 32px; width: 320px; display: flex; flex-direction: column; gap: 14px;
+}
+.lock-card label { font-size: .78rem; color: var(--text-muted); letter-spacing: 1px; text-transform: uppercase; display: block; margin-bottom: 4px; }
+.lock-card input {
+  background: var(--dark4); border: 1px solid var(--border); color: var(--text);
+  padding: 12px 16px; border-radius: 6px; font-size: 1.1rem; text-align: center;
+  letter-spacing: 4px; width: 100%; outline: none;
+}
+.lock-card input:focus { border-color: var(--gold); }
+.lock-card input.no-letter-spacing { letter-spacing: 1px; font-size: .95rem; }
+.lock-card button {
+  background: var(--gold); color: var(--dark); border: none;
+  padding: 13px; border-radius: 6px; font-size: 1rem; font-weight: 700;
+  cursor: pointer; letter-spacing: 2px; width: 100%; margin-top: 4px;
+}
+.lock-card button:hover { background: var(--gold-light); }
+#lockErrMsg { color: var(--red); font-size: .85rem; min-height: 18px; text-align: center; }
+
+/* ── RELOCK SCREEN (bloquear app) ── */
+#relockScreen {
+  position: fixed; inset: 0; background: rgba(13,13,13,0.97);
+  display: none; flex-direction: column; align-items: center; justify-content: center;
+  z-index: 9999;
+}
+#relockScreen h2 { font-family: 'Bebas Neue', sans-serif; font-size: 2.2rem; color: var(--gold); letter-spacing: 3px; margin-bottom: 6px; }
+#relockScreen p { color: var(--text-muted); margin-bottom: 20px; font-size: .9rem; }
+#relockScreen input {
+  background: var(--dark3); border: 1px solid var(--border); color: var(--text);
+  padding: 12px 20px; border-radius: 6px; font-size: 1.1rem; text-align: center;
+  letter-spacing: 6px; width: 240px; outline: none; display: block; margin-bottom: 10px;
+}
+#relockScreen input:focus { border-color: var(--gold); }
+#relockScreen button {
+  background: var(--gold); color: var(--dark); border: none; padding: 12px;
+  border-radius: 6px; font-weight: 700; cursor: pointer; width: 240px; display: block;
+}
+#relockErrMsg { color: var(--red); font-size: .85rem; min-height: 18px; margin-top: 8px; text-align:center; }
+
+/* ── HEADER ── */
+header {
+  background: var(--dark2); border-bottom: 2px solid var(--gold);
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 24px; height: 60px; position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+}
+.brand { font-family: 'Bebas Neue', sans-serif; font-size: 1.8rem; color: var(--gold); letter-spacing: 3px; }
+.nav-tabs { display: flex; gap: 4px; }
+.nav-tab {
+  background: none; border: none; color: var(--text-muted); padding: 8px 24px;
+  font-family: 'Barlow Condensed', sans-serif; font-size: 1rem; font-weight: 600;
+  letter-spacing: 2px; cursor: pointer; border-radius: 4px; transition: all .2s;
+  text-transform: uppercase;
+}
+.nav-tab:hover { color: var(--text); background: var(--dark4); }
+.nav-tab.active { color: var(--gold); background: var(--dark4); border-bottom: 2px solid var(--gold); }
+.header-actions { display: flex; gap: 10px; }
+.btn-lock {
+  background: var(--dark4); border: 1px solid var(--border); color: var(--text-muted);
+  padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: .85rem;
+  display: flex; align-items: center; gap: 6px; transition: all .2s;
+}
+.btn-lock:hover { color: var(--gold); border-color: var(--gold); }
+
+/* ── MAIN ── */
+main { padding-top: 50px; height: 100svh; overflow: hidden; }
+.module { display: none; height: 100%; }
+.module.active { display: flex; }
+
+/* ══════════════════════════════
+   VENTAS MODULE
+══════════════════════════════ */
+#modVentas { flex-direction: row; }
+
+.products-panel {
+  flex: 1; display: flex; flex-direction: column; overflow: hidden;
+  background: var(--dark2);
+}
+.cat-tabs {
+  display: flex; gap: 0; border-bottom: 1px solid var(--border);
+  padding: 0 16px; background: var(--dark3); flex-shrink: 0;
+}
+.cat-tab {
+  background: none; border: none; color: var(--text-muted); padding: 12px 20px;
+  font-family: 'Barlow Condensed', sans-serif; font-size: .95rem; font-weight: 600;
+  letter-spacing: 1px; cursor: pointer; border-bottom: 2px solid transparent;
+  text-transform: uppercase; transition: all .2s;
+}
+.cat-tab:hover { color: var(--text); }
+.cat-tab.active { color: var(--gold); border-bottom-color: var(--gold); }
+
+.products-grid {
+  flex: 1;
+  overflow-y: scroll;
+  overflow-x: hidden;
+  padding: 16px 14px 16px 16px;
+  display: grid;
+  /* columnas fijas de 150px — nunca se encogen */
+  grid-template-columns: repeat(auto-fill, 150px);
+  gap: 12px;
+  align-content: start;
+}
+/* Scrollbar derecha — siempre visible, dorada */
+.products-grid::-webkit-scrollbar { width: 10px; }
+.products-grid::-webkit-scrollbar-track {
+  background: var(--dark3); border-left: 1px solid var(--border);
+}
+.products-grid::-webkit-scrollbar-thumb {
+  background: var(--gold); border-radius: 6px; border: 2px solid var(--dark3);
+}
+.products-grid::-webkit-scrollbar-thumb:hover { background: var(--gold-light); }
+
+/* Tarjeta — tamaño fijo, nunca se reduce */
+.prod-card {
+  background: var(--dark3); border: 1px solid var(--border); border-radius: 8px;
+  display: flex; flex-direction: column; cursor: pointer; transition: all .2s;
+  overflow: hidden; position: relative;
+  width: 150px; height: 195px;
+  flex-shrink: 0;
+}
+.prod-card:hover { border-color: var(--gold); transform: translateY(-2px); box-shadow: 0 4px 16px rgba(212,168,67,.15); }
+.prod-card.drag-source { opacity: .4; border-style: dashed; }
+.prod-card.drag-over   { border-color: var(--gold); box-shadow: 0 0 0 2px var(--gold); transform: scale(1.04); }
+.prod-drag-handle {
+  position: absolute; top: 4px; right: 5px;
+  color: var(--text-muted); font-size: .85rem; cursor: grab; line-height: 1;
+  opacity: 0; transition: opacity .15s; z-index: 2;
+  user-select: none;
+}
+.prod-card:hover .prod-drag-handle { opacity: 1; }
+.prod-drag-handle:active { cursor: grabbing; }
+.prod-card.out-of-stock { opacity: .5; cursor: not-allowed; }
+.prod-img {
+  width: 150px; height: 105px; flex-shrink: 0;
+  background: var(--dark4);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--text-muted); font-size: 2.2rem; overflow: hidden;
+}
+.prod-img img { width: 100%; height: 100%; object-fit: cover; }
+.prod-info {
+  padding: 7px 8px; flex: 1;
+  display: flex; flex-direction: column; justify-content: space-between;
+  overflow: hidden;
+}
+.prod-name {
+  font-size: .78rem; font-weight: 600; color: var(--text); line-height: 1.25;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.prod-price { font-size: .82rem; color: var(--gold); font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.prod-stock { font-size: .7rem; color: var(--text-muted); white-space: nowrap; }
+
+/* ORDER PANEL */
+.order-panel {
+  width: 340px; background: var(--dark3); border-left: 1px solid var(--border);
+  display: flex; flex-direction: column; flex-shrink: 0;
+}
+.order-header {
+  padding: 16px; border-bottom: 1px solid var(--border);
+  background: var(--dark2);
+}
+.order-header h2 { font-family: 'Bebas Neue', sans-serif; font-size: 1.4rem; color: var(--gold); letter-spacing: 2px; }
+.waiter-select {
+  width: 100%; margin-top: 10px; background: var(--dark4); border: 1px solid var(--border);
+  color: var(--text); padding: 8px 12px; border-radius: 4px; font-size: .9rem; outline: none;
+}
+.waiter-select:focus { border-color: var(--gold); }
+
+.order-items { flex: 1; overflow-y: auto; padding: 12px; }
+.order-items::-webkit-scrollbar { width: 4px; }
+.order-items::-webkit-scrollbar-thumb { background: var(--dark5); }
+
+.order-empty { text-align: center; color: var(--text-muted); padding: 40px 0; font-size: .9rem; }
+
+.order-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,.05);
+}
+.order-item-name { flex: 1; font-size: .85rem; font-weight: 500; }
+.order-item-qty {
+  display: flex; align-items: center; gap: 4px;
+}
+.qty-btn {
+  background: var(--dark5); border: none; color: var(--text); width: 24px; height: 24px;
+  border-radius: 4px; cursor: pointer; font-size: .9rem; display: flex; align-items: center; justify-content: center;
+}
+.qty-btn:hover { background: var(--gold); color: var(--dark); }
+.qty-num { width: 28px; text-align: center; font-weight: 700; font-size: .9rem; }
+.order-item-subtotal { font-size: .85rem; color: var(--gold); font-weight: 600; min-width: 60px; text-align: right; }
+.order-item-del { background: none; border: none; color: var(--red); cursor: pointer; font-size: 1rem; padding: 2px; }
+
+.order-footer { padding: 16px; border-top: 1px solid var(--border); background: var(--dark2); }
+.order-total-row { display: flex; justify-content: space-between; margin-bottom: 8px; }
+.order-total-label { font-size: .85rem; color: var(--text-muted); }
+.order-total-val { font-size: 1.1rem; color: var(--gold); font-weight: 700; }
+.btn-dispatch {
+  width: 100%; background: var(--gold); color: var(--dark); border: none;
+  padding: 14px; border-radius: 6px; font-size: 1rem; font-weight: 700;
+  cursor: pointer; letter-spacing: 1px; margin-top: 12px; transition: all .2s;
+}
+.btn-dispatch:hover { background: var(--gold-light); }
+.btn-clear {
+  width: 100%; background: none; color: var(--red); border: 1px solid var(--red);
+  padding: 10px; border-radius: 6px; font-size: .85rem; cursor: pointer; margin-top: 8px;
+}
+.btn-clear:hover { background: var(--red); color: #fff; }
+
+/* ══════════════════════════════
+   ADMIN MODULE
+══════════════════════════════ */
+#modAdmin { flex-direction: column; }
+#adminLock {
+  position: absolute; inset: 60px 0 0; background: rgba(0,0,0,.9) url('') center;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 50;
+}
+#adminLock h2 { font-family: 'Bebas Neue', sans-serif; font-size: 2.5rem; color: var(--gold); letter-spacing: 3px; margin-bottom: 8px; }
+#adminLock p { color: var(--text-muted); margin-bottom: 24px; }
+#adminLock input {
+  background: var(--dark3); border: 1px solid var(--border); color: var(--text);
+  padding: 12px 20px; border-radius: 6px; font-size: 1.1rem; text-align: center;
+  letter-spacing: 8px; width: 220px; outline: none; display: block; margin-bottom: 12px;
+}
+#adminLock input:focus { border-color: var(--gold); }
+#adminLock button {
+  background: var(--gold); color: var(--dark); border: none; padding: 12px 40px;
+  border-radius: 6px; font-weight: 700; cursor: pointer; width: 220px;
+}
+#adminErrMsg { color: var(--red); font-size: .85rem; min-height: 18px; margin-top: 8px; }
+
+.admin-layout { display: flex; flex: 1; overflow: hidden; }
+.admin-sidebar {
+  width: 200px; background: var(--dark2); border-right: 1px solid var(--border);
+  padding: 16px 0; flex-shrink: 0;
+}
+.admin-nav-item {
+  display: flex; align-items: center; gap: 10px; padding: 12px 20px;
+  color: var(--text-muted); cursor: pointer; font-weight: 500; font-size: .9rem;
+  border-left: 3px solid transparent; transition: all .2s;
+}
+.admin-nav-item:hover { color: var(--text); background: var(--dark3); }
+.admin-nav-item.active { color: var(--gold); border-left-color: var(--gold); background: var(--dark3); }
+.admin-nav-item span.icon { font-size: 1.2rem; }
+
+.admin-content { flex: 1; overflow-y: auto; padding: 24px; }
+.admin-content::-webkit-scrollbar { width: 6px; }
+.admin-content::-webkit-scrollbar-thumb { background: var(--dark5); }
+
+.admin-section { display: none; }
+.admin-section.active { display: block; }
+.section-title {
+  font-family: 'Bebas Neue', sans-serif; font-size: 1.8rem; color: var(--gold);
+  letter-spacing: 2px; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 10px;
+}
+
+/* TABLE */
+.data-table { width: 100%; border-collapse: collapse; }
+.data-table th {
+  background: var(--dark3); color: var(--gold); text-align: left; padding: 10px 12px;
+  font-family: 'Barlow Condensed', sans-serif; letter-spacing: 1px; font-size: .85rem;
+  border-bottom: 1px solid var(--border);
+}
+.data-table td { padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,.05); font-size: .88rem; }
+.data-table tr:hover td { background: rgba(255,255,255,.02); }
+
+/* BUTTONS */
+.btn { padding: 8px 16px; border-radius: 4px; border: none; cursor: pointer; font-weight: 600; font-size: .85rem; transition: all .2s; }
+.btn-primary { background: var(--gold); color: var(--dark); }
+.btn-primary:hover { background: var(--gold-light); }
+.btn-danger { background: var(--red); color: #fff; }
+.btn-danger:hover { background: #e74c3c; }
+.btn-secondary { background: var(--dark4); color: var(--text); border: 1px solid var(--border); }
+.btn-secondary:hover { border-color: var(--gold); color: var(--gold); }
+.btn-success { background: var(--green); color: #fff; }
+.btn-info { background: var(--blue); color: #fff; }
+
+/* FORMS */
+.form-group { margin-bottom: 16px; }
+.form-group label { display: block; font-size: .85rem; color: var(--text-muted); margin-bottom: 6px; letter-spacing: .5px; }
+.form-group input, .form-group select, .form-group textarea {
+  width: 100%; background: var(--dark4); border: 1px solid var(--border); color: var(--text);
+  padding: 10px 12px; border-radius: 4px; font-size: .9rem; outline: none; font-family: 'Barlow', sans-serif;
+}
+.form-group input:focus, .form-group select:focus { border-color: var(--gold); }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.form-actions { display: flex; gap: 10px; margin-top: 20px; }
+
+.card {
+  background: var(--dark3); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 20px;
+}
+.card-title { font-family: 'Barlow Condensed', sans-serif; font-size: 1.1rem; font-weight: 700; color: var(--gold); margin-bottom: 16px; letter-spacing: 1px; text-transform: uppercase; }
+
+/* MODAL */
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.8);
+  display: flex; align-items: center; justify-content: center; z-index: 200;
+}
+.modal { background: var(--dark2); border: 1px solid var(--border); border-radius: 8px; padding: 28px; min-width: 400px; max-width: 90%; max-height: 90vh; overflow-y: auto; }
+.modal h3 { font-family: 'Bebas Neue', sans-serif; font-size: 1.5rem; color: var(--gold); letter-spacing: 2px; margin-bottom: 20px; }
+.modal-actions { display: flex; gap: 10px; margin-top: 20px; justify-content: flex-end; }
+
+/* STATS */
+.stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
+.stat-card { background: var(--dark3); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
+.stat-label { font-size: .78rem; color: var(--text-muted); letter-spacing: 1px; text-transform: uppercase; }
+.stat-value { font-family: 'Bebas Neue', sans-serif; font-size: 2rem; color: var(--gold); margin-top: 4px; }
+
+/* BADGE */
+.badge { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: .75rem; font-weight: 700; }
+.badge-green { background: rgba(39,174,96,.2); color: var(--green); }
+.badge-red { background: rgba(192,57,43,.2); color: var(--red); }
+.badge-blue { background: rgba(41,128,185,.2); color: var(--blue); }
+.badge-gold { background: rgba(212,168,67,.2); color: var(--gold); }
+
+/* IMG PREVIEW */
+.img-preview {
+  width: 80px; height: 80px; border-radius: 6px; object-fit: cover;
+  background: var(--dark4); border: 1px dashed var(--border);
+  display: flex; align-items: center; justify-content: center; color: var(--text-muted); font-size: 1.5rem;
+  overflow: hidden;
+}
+.img-preview img { width: 100%; height: 100%; object-fit: cover; }
+
+/* PRINT */
+@media print {
+  body * { visibility: hidden; }
+  #printArea, #printArea * { visibility: visible; }
+  #printArea { position: fixed; left: 0; top: 0; width: 100%; }
+}
+
+/* NOTIFICATION */
+.notif {
+  position: fixed; top: 70px; right: 20px; background: var(--dark3);
+  border-left: 4px solid var(--gold); padding: 12px 20px; border-radius: 4px;
+  z-index: 1000; font-size: .9rem; animation: slideIn .3s ease;
+  box-shadow: 0 4px 20px rgba(0,0,0,.3);
+}
+.notif.error { border-left-color: var(--red); }
+.notif.success { border-left-color: var(--green); }
+@keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+/* SCROLLBAR */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--dark2); }
+::-webkit-scrollbar-thumb { background: var(--dark5); border-radius: 3px; }
+
+/* PRODUCT IMG CELL */
+.prod-thumb { width: 36px; height: 36px; border-radius: 4px; object-fit: cover; background: var(--dark4); display: inline-flex; align-items: center; justify-content: center; font-size: 1rem; overflow: hidden; }
+.prod-thumb img { width: 100%; height: 100%; object-fit: cover; }
+
+/* HIDDEN */
+.hidden { display: none !important; }
+
+.excel-info { font-size: .78rem; color: var(--text-muted); margin-top: 6px; }
+
+/* ══════════════════════════════════════════════════════
+   MOBILE-FIRST RESPONSIVE  —  Viewport · Flexbox · Grid
+   Base = smartphones (< 480px)
+   Luego escala: 480 → 640 → 900 → 1200
+══════════════════════════════════════════════════════ */
+
+/* ── BASE (móvil pequeño: < 480px) ── */
+
+/* Header: una sola fila compacta */
+header { padding: 0 8px; height: 50px; gap: 4px; }
+.brand { font-size: .88rem; letter-spacing: 1px; white-space: nowrap; }
+.nav-tabs { gap: 2px; }
+.nav-tab { padding: 5px 8px; font-size: .72rem; letter-spacing: .5px; }
+/* Texto del botón bloquear: oculto en móvil */
+.btn-lock .lock-text { display: none; }
+.btn-lock { padding: 6px 8px; font-size: .9rem; }
+
+/* Main: espacio para header */
+main { padding-top: 50px; }
+
+/* Ventas: apilado vertical */
+#modVentas { flex-direction: column; overflow-y: auto; }
+.products-panel { flex: none; height: 52svh; }
+.order-panel {
+  width: 100%; border-left: none;
+  border-top: 2px solid var(--border);
+  flex: none; flex-direction: column;
+  height: auto; min-height: 160px;
+}
+
+/* Grid de productos: columnas pequeñas */
+.cat-tabs {
+  padding: 0 6px; overflow-x: auto;
+  flex-wrap: nowrap; -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.cat-tabs::-webkit-scrollbar { display: none; }
+.cat-tab { padding: 8px 10px; font-size: .72rem; white-space: nowrap; flex-shrink: 0; }
+
+.products-grid {
+  grid-template-columns: repeat(auto-fill, 100px);
+  gap: 7px; padding: 7px;
+}
+.prod-card { width: 100px; height: 142px; }
+.prod-img  { width: 100px; height: 68px; font-size: 1.4rem; }
+.prod-name { font-size: .68rem; }
+.prod-price { font-size: .7rem; }
+
+/* Panel de pedido */
+.order-header { padding: 8px 10px; }
+.order-header h2 { font-size: 1rem; }
+.waiter-select { padding: 5px 8px; font-size: .78rem; margin-top: 5px; }
+.order-items { padding: 6px; flex: none; overflow-y: visible; }
+.order-item { padding: 6px 0; gap: 5px; }
+.order-item-name { font-size: .74rem; }
+.qty-btn { width: 28px; height: 28px; font-size: .95rem; }
+.qty-num { font-size: .78rem; width: 22px; }
+.order-item-subtotal { font-size: .74rem; min-width: 46px; }
+.order-footer { padding: 8px 10px; }
+.order-total-val { font-size: .9rem; }
+.btn-dispatch { padding: 10px; font-size: .84rem; }
+.btn-clear { padding: 7px; font-size: .74rem; }
+
+/* Admin: barra horizontal de navegación */
+.admin-layout { flex-direction: column; }
+.admin-sidebar {
+  width: 100%;
+  display: flex; flex-direction: row;
+  overflow-x: auto; -webkit-overflow-scrolling: touch;
+  padding: 0; border-right: none;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0; scrollbar-width: none;
+}
+.admin-sidebar::-webkit-scrollbar { display: none; }
+.admin-nav-item {
+  flex-direction: column; gap: 3px;
+  padding: 8px 12px; border-left: none;
+  border-bottom: 3px solid transparent;
+  white-space: nowrap; font-size: .74rem; flex-shrink: 0;
+}
+.admin-nav-item.active { border-bottom-color: var(--gold); border-left-color: transparent; }
+.admin-sidebar > div[style*="margin-top:auto"] {
+  margin-top: 0 !important; padding: 6px 10px;
+  display: flex; align-items: center;
+}
+.admin-content { padding: 10px; }
+.section-title { font-size: 1.3rem; margin-bottom: 12px; }
+.card { padding: 12px; margin-bottom: 12px; }
+.card-title { font-size: .88rem; }
+
+/* Stats: 2 columnas en móvil */
+.stats-grid { grid-template-columns: repeat(2, 1fr); gap: 8px; margin-bottom: 16px; }
+.stat-card { padding: 10px; }
+.stat-value { font-size: 1.4rem; }
+
+/* Formularios: 1 columna */
+.form-grid { grid-template-columns: 1fr; }
+.form-grid .form-group[style*="grid-column"] { grid-column: 1 !important; }
+.form-actions { flex-wrap: wrap; gap: 8px; }
+.form-actions .btn { flex: 1; min-width: 140px; text-align: center; justify-content: center; }
+
+/* Tablas: scroll horizontal */
+.data-table-wrapper { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.data-table { min-width: 440px; }
+
+/* Modal */
+.modal { min-width: unset; width: 96vw; padding: 14px; max-height: 90svh; }
+.modal h3 { font-size: 1.1rem; margin-bottom: 14px; }
+.modal-actions { flex-wrap: wrap; gap: 8px; }
+.modal-actions .btn { flex: 1; min-width: 100px; }
+
+/* Pantallas de bloqueo */
+#lockScreen h1 { font-size: 2rem; letter-spacing: 2px; }
+.lock-card { width: 92vw; padding: 18px; }
+#relockScreen input,
+#relockScreen button { width: 88vw; max-width: 240px; }
+#adminLock input,
+#adminLock button { width: 88vw; max-width: 220px; }
+
+/* Teclado virtual: pantalla completa en móvil */
+#vKeyboard {
+  min-width: unset; width: 100vw;
+  left: 0; transform: none; bottom: 0;
+  border-radius: 14px 14px 0 0;
+  padding: 10px 6px 8px;
+}
+#vKeyboard .vk-row { gap: 3px; }
+#vKeyboard .vk-key {
+  font-size: .9rem; height: 40px;
+  min-width: 30px; padding: 0 3px; border-radius: 5px;
+}
+#vKeyboard .vk-key.wide   { min-width: 56px; }
+#vKeyboard .vk-key.wider  { min-width: 76px; }
+#vKeyboard .vk-key.space  { min-width: 80px; }
+#vKeyboard .vk-key.enter  { min-width: 60px; }
+#vKeyboard .vk-key.vk-key-num { min-width: 64px; height: 50px; font-size: 1.25rem; }
+
+/* Notificación: ancho completo en móvil */
+.notif { right: 8px; left: 8px; font-size: .8rem; }
+
+/* ── SMARTPHONE MEDIANO (≥ 480px) ── */
+@media (min-width: 480px) {
+  header { height: 52px; padding: 0 10px; }
+  .brand { font-size: 1rem; letter-spacing: 1px; }
+  .nav-tab { padding: 5px 10px; font-size: .78rem; }
+  main { padding-top: 52px; }
+  .products-panel { height: 54svh; }
+  .order-panel { height: auto; min-height: 160px; }
+  .products-grid { grid-template-columns: repeat(auto-fill, 110px); gap: 8px; padding: 8px; }
+  .prod-card { width: 110px; height: 155px; }
+  .prod-img  { width: 110px; height: 75px; font-size: 1.6rem; }
+  .prod-name { font-size: .72rem; }
+  .prod-price { font-size: .74rem; }
+  .cat-tab { padding: 9px 12px; font-size: .78rem; }
+  .stats-grid { gap: 10px; }
+  #vKeyboard .vk-key { font-size: .98rem; height: 43px; min-width: 33px; }
+  #vKeyboard .vk-key.vk-key-num { min-width: 68px; height: 54px; font-size: 1.35rem; }
+}
+
+/* ── TABLET (≥ 640px) ── */
+@media (min-width: 640px) {
+  header { height: 56px; padding: 0 14px; }
+  .brand { font-size: 1.2rem; letter-spacing: 2px; }
+  .nav-tab { padding: 6px 14px; font-size: .86rem; letter-spacing: 1.5px; }
+  .btn-lock .lock-text { display: inline; }
+  .btn-lock { padding: 6px 12px; font-size: .82rem; }
+  main { padding-top: 56px; }
+  .products-panel { height: 56svh; }
+  .order-panel { height: auto; min-height: 160px; }
+  .products-grid { grid-template-columns: repeat(auto-fill, 125px); gap: 10px; padding: 12px; }
+  .prod-card { width: 125px; height: 170px; }
+  .prod-img  { width: 125px; height: 86px; font-size: 2rem; }
+  .prod-name { font-size: .76rem; }
+  .prod-price { font-size: .79rem; }
+  .cat-tab { padding: 10px 14px; font-size: .84rem; }
+  .admin-content { padding: 16px; }
+  .section-title { font-size: 1.6rem; }
+  .card { padding: 16px; }
+  .stats-grid { grid-template-columns: repeat(2, 1fr); gap: 12px; }
+  .stat-value { font-size: 1.6rem; }
+  .form-grid { grid-template-columns: 1fr 1fr; }
+  .modal { padding: 20px; }
+  .modal h3 { font-size: 1.4rem; }
+  #lockScreen h1 { font-size: 2.8rem; }
+  .lock-card { width: 340px; padding: 24px; }
+  #vKeyboard .vk-key { font-size: 1.1rem; height: 48px; min-width: 40px; }
+  #vKeyboard .vk-key.vk-key-num { min-width: 80px; height: 62px; font-size: 1.5rem; }
+  #vKeyboard { padding: 14px 14px 11px; }
+  #vKeyboard .vk-row { gap: 5px; }
+}
+
+/* ── DESKTOP (≥ 900px) ── */
+@media (min-width: 900px) {
+  header { height: 60px; padding: 0 24px; }
+  .brand { font-size: 1.8rem; letter-spacing: 3px; }
+  .nav-tab { padding: 8px 24px; font-size: 1rem; letter-spacing: 2px; }
+  main { padding-top: 60px; }
+
+  /* Ventas: side-by-side */
+  #modVentas { flex-direction: row; overflow-y: hidden; }
+  .products-panel { flex: 1; height: 100%; }
+  .order-panel {
+    width: 340px; flex: none; border-left: 1px solid var(--border);
+    border-top: none; height: 100%;
+  }
+  .order-items { flex: 1; overflow-y: auto; }
+  .products-grid { grid-template-columns: repeat(auto-fill, 150px); gap: 12px; padding: 16px 14px 16px 16px; }
+  .prod-card { width: 150px; height: 195px; }
+  .prod-img  { width: 150px; height: 105px; font-size: 2.2rem; }
+  .prod-name { font-size: .78rem; }
+  .prod-price { font-size: .82rem; }
+  .cat-tab { padding: 12px 20px; font-size: .95rem; letter-spacing: 1px; }
+
+  /* Admin: sidebar vertical */
+  .admin-layout { flex-direction: row; }
+  .admin-sidebar {
+    width: 200px; flex-direction: column;
+    border-right: 1px solid var(--border); border-bottom: none;
+    padding: 16px 0; overflow-x: visible; overflow-y: auto;
+  }
+  .admin-sidebar::-webkit-scrollbar { display: block; width: 4px; }
+  .admin-nav-item {
+    flex-direction: row; gap: 10px; padding: 12px 20px;
+    border-left: 3px solid transparent; border-bottom: none;
+    font-size: .9rem;
+  }
+  .admin-nav-item.active { border-left-color: var(--gold); border-bottom-color: transparent; }
+  .admin-sidebar > div[style*="margin-top:auto"] { margin-top: auto !important; padding: 16px; }
+  .admin-content { padding: 24px; }
+  .section-title { font-size: 1.8rem; margin-bottom: 20px; }
+  .card { padding: 20px; margin-bottom: 20px; }
+  .card-title { font-size: 1.1rem; }
+
+  .stats-grid { grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
+  .stat-card { padding: 20px; }
+  .stat-value { font-size: 2rem; }
+
+  .form-grid { grid-template-columns: 1fr 1fr; }
+  .modal { min-width: 400px; padding: 28px; }
+  .modal h3 { font-size: 1.5rem; margin-bottom: 20px; }
+  .data-table { min-width: unset; }
+
+  #lockScreen h1 { font-size: 3.6rem; }
+  .lock-card { width: 320px; padding: 28px 32px; }
+
+  #vKeyboard {
+    min-width: 700px; width: auto;
+    left: 50%; transform: translateX(-50%);
+    bottom: 20px; border-radius: 14px;
+    padding: 16px 18px 13px;
+  }
+  #vKeyboard .vk-row { gap: 6px; }
+  #vKeyboard .vk-key { font-size: 1.24rem; height: 52px; min-width: 49px; padding: 0 8px; border-radius: 8px; }
+  #vKeyboard .vk-key.wide   { min-width: 88px; }
+  #vKeyboard .vk-key.wider  { min-width: 125px; }
+  #vKeyboard .vk-key.space  { min-width: 234px; }
+  #vKeyboard .vk-key.enter  { min-width: 110px; }
+  #vKeyboard .vk-key.vk-key-num { min-width: 94px; height: 68px; font-size: 1.69rem; }
+
+  .notif { left: auto; right: 20px; font-size: .9rem; }
+}
+
+/* ── WIDE DESKTOP (≥ 1200px) ── */
+@media (min-width: 1200px) {
+  .order-panel { width: 380px; }
+  .products-grid { grid-template-columns: repeat(auto-fill, 160px); }
+  .prod-card { width: 160px; height: 205px; }
+  .prod-img  { width: 160px; height: 112px; }
+}
+
+/* ── TECLADO VIRTUAL FLOTANTE ── */
+#vKeyboard {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--dark2);
+  border: 1px solid var(--gold);
+  border-radius: 14px;
+  padding: 16px 18px 13px;
+  z-index: 10000;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.7), 0 0 0 1px rgba(212,168,67,0.15);
+  display: none;
+  flex-direction: column;
+  gap: 8px;
+  user-select: none;
+  min-width: 700px;
+}
+#vKeyboard .vk-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 5px; cursor: move;
+}
+#vKeyboard .vk-title {
+  font-family: 'Barlow Condensed', sans-serif; font-size: .98rem;
+  color: var(--text-muted); letter-spacing: 2px; text-transform: uppercase;
+}
+#vKeyboard .vk-close {
+  background: none; border: none; color: var(--text-muted); cursor: pointer;
+  font-size: 1.3rem; padding: 0 4px; line-height: 1; transition: color .2s;
+}
+#vKeyboard .vk-close:hover { color: var(--red); }
+#vKeyboard .vk-row {
+  display: flex; gap: 6px; justify-content: flex-start;
+}
+#vKeyboard .vk-key {
+  background: var(--dark4); border: 1px solid var(--border); color: var(--text);
+  border-radius: 8px; font-family: 'Barlow Condensed', sans-serif;
+  font-size: 1.24rem; font-weight: 600; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: all .12s; height: 52px; min-width: 49px; padding: 0 8px;
+  letter-spacing: .5px;
+}
+#vKeyboard .vk-key:hover  { background: var(--dark5); border-color: var(--gold); color: var(--gold); }
+#vKeyboard .vk-key:active { background: var(--gold); color: var(--dark); transform: scale(.93); }
+#vKeyboard .vk-key.wide   { min-width: 88px; }
+#vKeyboard .vk-key.wider  { min-width: 125px; }
+#vKeyboard .vk-key.space  { flex: 1; min-width: 234px; background: var(--dark3); }
+#vKeyboard .vk-key.space:hover { background: var(--dark5); }
+#vKeyboard .vk-key.del    { background: rgba(192,57,43,.18); border-color: rgba(192,57,43,.4); color: var(--red); }
+#vKeyboard .vk-key.del:hover  { background: var(--red); color: #fff; border-color: var(--red); }
+#vKeyboard .vk-key.enter  { background: rgba(39,174,96,.18); border-color: rgba(39,174,96,.4); color: var(--green); min-width: 110px; }
+#vKeyboard .vk-key.enter:hover  { background: var(--green); color: #fff; border-color: var(--green); }
+/* Teclas modo numérico — más grandes y cuadradas */
+#vKeyboard .vk-key.vk-key-num {
+  min-width: 94px; height: 68px; font-size: 1.69rem; font-weight: 700;
+  border-radius: 10px;
+}
+#vKeyboard .vk-indicator {
+  font-size: .91rem; color: var(--gold); text-align: right; margin-top: 2px;
+  font-family: 'Barlow Condensed', sans-serif; letter-spacing: 1px; min-height: 18px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+</style>
+</head>
+<body>
+
+<!-- STARTUP SCREEN -->
+<div id="lockScreen" style="display:none;">
+  <div style="font-size:3rem;margin-bottom:12px;">🍺</div>
+  <h1>TERRAZA LOS CADENAS</h1>
+  <p class="sub">SISTEMA POS — INICIO DE TURNO</p>
+
+  <!-- PASO 1: Selección de tipo de usuario -->
+  <div id="lockStep1" class="lock-card" style="gap:12px;">
+    <p style="text-align:center;color:var(--text-muted);font-size:.88rem;letter-spacing:1px;">¿Cómo deseas ingresar?</p>
+    <button onclick="lockSelectType('admin')" style="background:var(--dark4);border:1px solid var(--border);color:var(--text);padding:14px;border-radius:8px;font-size:1rem;font-family:'Barlow Condensed',sans-serif;letter-spacing:2px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:10px;transition:all .2s;" onmouseover="this.style.borderColor='var(--gold)';this.style.color='var(--gold)'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text)'">
+      🔐 &nbsp;ADMINISTRADOR
+    </button>
+    <button onclick="lockSelectType('mesero')" style="background:var(--dark4);border:1px solid var(--border);color:var(--text);padding:14px;border-radius:8px;font-size:1rem;font-family:'Barlow Condensed',sans-serif;letter-spacing:2px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:10px;transition:all .2s;" onmouseover="this.style.borderColor='var(--gold)';this.style.color='var(--gold)'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text)'">
+      👤 &nbsp;MESERO
+    </button>
+    <button onclick="lockSelectType('cliente')" style="background:var(--dark4);border:1px solid rgba(39,174,96,0.4);color:var(--green);padding:14px;border-radius:8px;font-size:1rem;font-family:'Barlow Condensed',sans-serif;letter-spacing:2px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:10px;transition:all .2s;" onmouseover="this.style.borderColor='var(--green)';this.style.background='rgba(39,174,96,0.1)'" onmouseout="this.style.borderColor='rgba(39,174,96,0.4)';this.style.background='var(--dark4)'">
+      🧾 &nbsp;CLIENTES
+    </button>
+  </div>
+
+  <!-- PASO 2C: Portal Cliente -->
+  <div id="lockStep2Cliente" class="lock-card" style="display:none;gap:14px;">
+    <button onclick="lockGoBack()" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:.82rem;text-align:left;padding:0;letter-spacing:1px;">&#8592; Volver</button>
+    <p style="text-align:center;color:var(--text-muted);font-size:.85rem;">Ingresa tu c&#xF3;digo de cliente para ver tu estado de cuenta</p>
+    <div>
+      <label style="font-size:.78rem;color:var(--text-muted);letter-spacing:1px;text-transform:uppercase;display:block;margin-bottom:4px;">C&#xF3;digo de Cliente</label>
+      <input type="text" id="lockClientCode" placeholder="Ej: A3F7" maxlength="4" style="background:var(--dark4);border:1px solid rgba(39,174,96,0.5);color:var(--green);padding:12px 16px;border-radius:6px;font-size:1.4rem;text-align:center;letter-spacing:6px;width:100%;outline:none;font-family:'Roboto Mono',monospace;text-transform:uppercase;" onkeydown="if(event.key==='Enter')verClientePortal()" oninput="this.value=this.value.toUpperCase()">
+    </div>
+    <button onclick="verClientePortal()" style="background:var(--green);color:#fff;border:none;padding:13px;border-radius:6px;font-size:1rem;font-weight:700;cursor:pointer;letter-spacing:2px;width:100%;">VER MI CUENTA</button>
+    <div id="lockClientErrMsg" style="color:var(--red);font-size:.85rem;min-height:18px;text-align:center;"></div>
+  </div>
+
+  <!-- PASO 2A: Login Administrador -->
+  <div id="lockStep2Admin" class="lock-card" style="display:none;">
+    <button onclick="lockGoBack()" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:.82rem;text-align:left;padding:0;letter-spacing:1px;">← Volver</button>
+    <div id="baseCajaWrapper">
+      <label>Base de Caja ($)</label>
+      <input type="number" id="baseInput" class="no-letter-spacing" placeholder="0" min="0" onkeydown="if(event.key==='Enter')document.getElementById('lockPwInput').focus()">
+    </div>
+    <div>
+      <label>Contraseña de Administrador</label>
+      <input type="password" id="lockPwInput" placeholder="••••" maxlength="6" onkeydown="if(event.key==='Enter')unlockApp()">
+    </div>
+    <button id="lockAdminBtn" onclick="unlockApp()">INICIAR TURNO</button>
+    <div id="lockErrMsg"></div>
+  </div>
+
+  <!-- PASO 2B: Login Mesero -->
+  <div id="lockStep2Mesero" class="lock-card" style="display:none;">
+    <button onclick="lockGoBack()" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:.82rem;text-align:left;padding:0;letter-spacing:1px;">← Volver</button>
+    <div>
+      <label>Usuario</label>
+      <input type="text" id="lockMeseroUser" placeholder="Tu usuario" autocomplete="off" onkeydown="if(event.key==='Enter')document.getElementById('lockMeseroPw').focus()">
+    </div>
+    <div>
+      <label>Contraseña</label>
+      <input type="password" id="lockMeseroPw" placeholder="••••" maxlength="20" onkeydown="if(event.key==='Enter')unlockAsMesero()">
+    </div>
+    <button onclick="unlockAsMesero()">ENTRAR</button>
+    <div id="lockMeseroErrMsg"></div>
+  </div>
+</div>
+
+<!-- RELOCK SCREEN -->
+<div id="relockScreen">
+  <div style="font-size:2.5rem;margin-bottom:8px;">🔒</div>
+  <h2>APP BLOQUEADA</h2>
+  <p>Selecciona tu tipo de acceso</p>
+
+  <!-- Selector tipo -->
+  <div id="relockTypeSelect" style="display:flex;flex-direction:column;gap:10px;width:240px;">
+    <button onclick="relockSelectType('admin')" style="background:var(--dark4);border:1px solid var(--border);color:var(--text);padding:13px;border-radius:8px;font-size:.95rem;font-family:'Barlow Condensed',sans-serif;letter-spacing:2px;cursor:pointer;" onmouseover="this.style.borderColor='var(--gold)';this.style.color='var(--gold)'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text)'">🔐 ADMINISTRADOR</button>
+    <button onclick="relockSelectType('mesero')" style="background:var(--dark4);border:1px solid var(--border);color:var(--text);padding:13px;border-radius:8px;font-size:.95rem;font-family:'Barlow Condensed',sans-serif;letter-spacing:2px;cursor:pointer;" onmouseover="this.style.borderColor='var(--gold)';this.style.color='var(--gold)'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text)'">👤 MESERO</button>
+    <button onclick="relockSelectType('cliente')" style="background:var(--dark4);border:1px solid rgba(39,174,96,0.4);color:var(--green);padding:13px;border-radius:8px;font-size:.95rem;font-family:'Barlow Condensed',sans-serif;letter-spacing:2px;cursor:pointer;" onmouseover="this.style.borderColor='var(--green)';this.style.background='rgba(39,174,96,0.1)'" onmouseout="this.style.borderColor='rgba(39,174,96,0.4)';this.style.background='var(--dark4)'">🧾 CLIENTES</button>
+  </div>
+
+  <!-- Formulario Cliente (relock) -->
+  <div id="relockClienteForm" style="display:none;flex-direction:column;align-items:center;gap:10px;">
+    <button onclick="relockGoBack()" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:.82rem;align-self:flex-start;letter-spacing:1px;">&#8592; Volver</button>
+    <p style="color:var(--text-muted);font-size:.83rem;text-align:center;">Ingresa tu c&#xF3;digo para ver tu cuenta</p>
+    <input type="text" id="relockClientCode" placeholder="Ej: A3F7" maxlength="4" style="background:var(--dark3);border:1px solid rgba(39,174,96,0.5);color:var(--green);padding:12px 20px;border-radius:6px;font-size:1.3rem;text-align:center;letter-spacing:6px;width:240px;outline:none;font-family:'Roboto Mono',monospace;text-transform:uppercase;" onkeydown="if(event.key==='Enter')relockVerCliente()" oninput="this.value=this.value.toUpperCase()">
+    <button onclick="relockVerCliente()" style="background:var(--green);color:#fff;border:none;padding:12px;border-radius:6px;font-weight:700;cursor:pointer;width:240px;">VER MI CUENTA</button>
+    <div id="relockClientErrMsg" style="color:var(--red);font-size:.85rem;min-height:18px;text-align:center;"></div>
+  </div>
+
+  <!-- Formulario Admin -->
+  <div id="relockAdminForm" style="display:none;flex-direction:column;align-items:center;gap:10px;">
+    <button onclick="relockGoBack()" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:.82rem;align-self:flex-start;letter-spacing:1px;">← Volver</button>
+    <input type="password" id="relockInput" placeholder="••••" maxlength="6" onkeydown="if(event.key==='Enter')reUnlockApp()">
+    <button onclick="reUnlockApp()">DESBLOQUEAR</button>
+    <div id="relockErrMsg"></div>
+  </div>
+
+  <!-- Formulario Mesero -->
+  <div id="relockMeseroForm" style="display:none;flex-direction:column;align-items:center;gap:10px;">
+    <button onclick="relockGoBack()" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:.82rem;align-self:flex-start;letter-spacing:1px;">← Volver</button>
+    <input type="text"     id="relockMeseroUser" placeholder="Usuario"     style="background:var(--dark3);border:1px solid var(--border);color:var(--text);padding:12px 20px;border-radius:6px;font-size:1rem;text-align:center;width:240px;outline:none;" onkeydown="if(event.key==='Enter')document.getElementById('relockMeseroPw').focus()">
+    <input type="password" id="relockMeseroPw"   placeholder="Contraseña" style="background:var(--dark3);border:1px solid var(--border);color:var(--text);padding:12px 20px;border-radius:6px;font-size:1rem;text-align:center;letter-spacing:4px;width:240px;outline:none;" onkeydown="if(event.key==='Enter')reUnlockAsMesero()">
+    <button onclick="reUnlockAsMesero()" style="background:var(--gold);color:var(--dark);border:none;padding:12px;border-radius:6px;font-weight:700;cursor:pointer;width:240px;">ENTRAR</button>
+    <div id="relockMeseroErrMsg" style="color:var(--red);font-size:.85rem;min-height:18px;text-align:center;"></div>
+  </div>
+</div>
+
+<!-- HEADER -->
+<header>
+  <div class="brand">🍺 TERRAZA LOS CADENAS</div>
+  <div class="nav-tabs">
+    <button class="nav-tab active" onclick="switchModule('ventas')">🛒 VENTAS</button>
+    <button class="nav-tab" id="tabAdmin" onclick="switchModule('admin')">⚙️ ADMINISTRACIÓN</button>
+    <button class="nav-tab hidden" id="tabMisClientes" onclick="switchModule('misclientes')">🧑‍🤝‍🧑 MIS CLIENTES</button>
+  </div>
+  <div class="header-actions">
+    <span id="fbStatusIndicator" style="font-size:.72rem;font-family:'Barlow Condensed',sans-serif;letter-spacing:1px;color:var(--text-muted);opacity:0.7;" title="Estado Firebase">⏳ Firebase</span>
+    <span id="sessionLabel" style="color:var(--gold);font-size:.82rem;font-family:'Barlow Condensed',sans-serif;letter-spacing:1px;display:none;"></span>
+    <button class="btn-lock" onclick="lockApp()">🔒 <span class="lock-text">Bloquear</span></button>
+  </div>
+</header>
+
+<main>
+
+<!-- ═══════════════════════════════════
+     MÓDULO VENTAS
+═══════════════════════════════════ -->
+<div id="modVentas" class="module active">
+
+  <!-- PRODUCTOS -->
+  <div class="products-panel">
+    <div class="cat-tabs">
+      <button class="cat-tab active" onclick="filterCat('all')">TODOS</button>
+      <button class="cat-tab" onclick="filterCat('cervezas')">🍺 CERVEZAS</button>
+      <button class="cat-tab" onclick="filterCat('bebidas')">🥤 BEBIDAS</button>
+      <button class="cat-tab" onclick="filterCat('botellas')">🍾 BOTELLAS</button>
+      <button class="cat-tab" onclick="filterCat('mecatos')">🍟 MECATOS</button>
+    </div>
+    <div class="products-grid" id="productsGrid">
+      <!-- populated by JS -->
+    </div>
+  </div>
+
+  <!-- PEDIDO -->
+  <div class="order-panel">
+    <div class="order-header">
+      <h2>📋 PEDIDO</h2>
+      <div id="waiterSelectWrapper">
+        <select class="waiter-select" id="orderWaiter" onchange="currentOrder.waiterId=this.value?parseInt(this.value):null;saveState()">
+          <option value="">— Seleccionar Mesero —</option>
+        </select>
+      </div>
+      <div style="margin-top:8px;">
+        <select class="waiter-select" id="orderCustomer" style="background:var(--dark4);border-color:rgba(39,174,96,0.6);color:var(--green);" onchange="currentOrder.customerId=this.value?parseInt(this.value):null;saveState()">
+          <option value="">— Seleccionar Cliente * —</option>
+        </select>
+      </div>
+      <button onclick="openNewCustomerModal()" style="margin-top:6px;width:100%;background:rgba(39,174,96,0.15);border:1px solid rgba(39,174,96,0.4);color:var(--green);padding:7px;border-radius:4px;font-size:.78rem;font-weight:600;cursor:pointer;letter-spacing:1px;transition:all .2s;" onmouseover="this.style.background='rgba(39,174,96,0.28)'" onmouseout="this.style.background='rgba(39,174,96,0.15)'">+ NUEVO CLIENTE</button>
+    </div>
+    <div class="order-items" id="orderItems">
+      <div class="order-empty">Agrega productos al pedido</div>
+    </div>
+    <div class="order-footer">
+      <div class="order-total-row">
+        <span class="order-total-label">SUBTOTAL</span>
+        <span id="orderSubtotal">$0</span>
+      </div>
+      <div class="order-total-row">
+        <span class="order-total-label" style="font-weight:700;color:var(--text)">TOTAL</span>
+        <span class="order-total-val" id="orderTotal">$0</span>
+      </div>
+      <button class="btn-dispatch" onclick="dispatchOrder()">DESPACHAR PEDIDO 🖨️</button>
+      <button class="btn-clear" onclick="clearOrder()">LIMPIAR PEDIDO</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════
+     MÓDULO ADMIN
+═══════════════════════════════════ -->
+<div id="modAdmin" class="module" style="position:relative;">
+
+  <!-- ADMIN LOCK - shown every time admin tab is opened -->
+  <div id="adminLock">
+    <div style="font-size:2.5rem;margin-bottom:8px;">🔐</div>
+    <h2>ADMINISTRACIÓN</h2>
+    <p>Ingresa la contraseña de administrador</p>
+    <input type="password" id="adminPwInput" placeholder="••••" maxlength="6" onkeydown="if(event.key==='Enter')unlockAdmin()">
+    <button onclick="unlockAdmin()">ACCEDER</button>
+    <div id="adminErrMsg"></div>
+  </div>
+
+  <div class="admin-layout">
+    <div class="admin-sidebar">
+      <div class="admin-nav-item active" onclick="adminNav('meseros')" data-sec="meseros"><span class="icon">👤</span> Meseros</div>
+      <div class="admin-nav-item" onclick="adminNav('clientes')" data-sec="clientes"><span class="icon">🧑‍🤝‍🧑</span> Clientes</div>
+      <div class="admin-nav-item" onclick="adminNav('inventario')" data-sec="inventario"><span class="icon">📦</span> Inventario</div>
+      <div class="admin-nav-item" onclick="adminNav('recaudos')" data-sec="recaudos"><span class="icon">💰</span> Recaudos</div>
+      <div class="admin-nav-item" onclick="adminNav('gastos')" data-sec="gastos"><span class="icon">📤</span> Gastos</div>
+      <div class="admin-nav-item" onclick="adminNav('historial')" data-sec="historial"><span class="icon">📑</span> Historial</div>
+      <div style="margin-top:auto;padding:16px;">
+        <button class="btn btn-danger" style="width:100%;font-size:.85rem;padding:12px 8px;" onclick="cierreDeTurno()">🖨️ CIERRE DE TURNO</button>
+      </div>
+    </div>
+
+    <div class="admin-content">
+
+      <!-- CLIENTES -->
+      <div id="secClientes" class="admin-section">
+        <div class="section-title">🧑‍🤝‍🧑 CLIENTES</div>
+        <div class="card">
+          <div class="card-title">Lista de Clientes y Estado de Cuenta</div>
+          <div style="display:flex;gap:10px;margin-bottom:12px;">
+            <input type="text" id="clientSearch" placeholder="Buscar cliente..." style="flex:1;background:var(--dark4);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:4px;outline:none;" oninput="renderClientes()">
+          </div>
+          <div class="data-table-wrapper"><table class="data-table" id="clientesTable">
+            <thead><tr><th>#</th><th>Nombre</th><th>Contacto</th><th>Código</th><th>Pedidos</th><th>Total</th><th>Recaudado</th><th>Pendiente</th><th>Acciones</th></tr></thead>
+            <tbody id="clientesTbody"></tbody>
+          </table></div>
+        </div>
+      </div>
+
+      <!-- MESEROS -->
+      <div id="secMeseros" class="admin-section active">
+        <div class="section-title">👤 MESEROS</div>
+        <div class="card">
+          <div class="card-title">Agregar Mesero</div>
+          <div class="form-grid" style="grid-template-columns:1fr 1fr;">
+            <div class="form-group" style="grid-column:1/-1;margin-bottom:12px;">
+              <label>Nombre Completo</label>
+              <input type="text" id="newWaiterName" placeholder="Nombre completo">
+            </div>
+            <div class="form-group" style="margin-bottom:12px;">
+              <label>Usuario (login)</label>
+              <input type="text" id="newWaiterUser" placeholder="ej: carlos01" autocomplete="off">
+            </div>
+            <div class="form-group" style="margin-bottom:12px;">
+              <label>Contraseña</label>
+              <input type="password" id="newWaiterPw" placeholder="••••" maxlength="20" autocomplete="off">
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="addWaiter()">+ AGREGAR MESERO</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">Lista de Meseros</div>
+          <div class="data-table-wrapper"><table class="data-table" id="waitersTable">
+            <thead><tr><th>#</th><th>Nombre</th><th>Usuario</th><th>Pedidos</th><th>Acciones</th></tr></thead>
+            <tbody id="waitersTbody"></tbody>
+          </table></div>
+        </div>
+        <div class="card">
+          <div class="card-title">📊 Estado de Cuenta por Mesero</div>
+          <div class="data-table-wrapper"><table class="data-table" id="waiterAccountTable">
+            <thead>
+              <tr>
+                <th>Mesero</th>
+                <th>Pedidos</th>
+                <th>Total Ventas</th>
+                <th>Recaudado</th>
+                <th>Pendiente</th>
+              </tr>
+            </thead>
+            <tbody id="waiterAccountTbody"></tbody>
+          </table></div>
+          <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border);display:flex;gap:24px;flex-wrap:wrap;">
+            <div><span style="color:var(--text-muted);font-size:.85rem;">Total Ventas:</span> <strong id="waiterStatVentas" style="color:var(--gold)">$0</strong></div>
+            <div><span style="color:var(--text-muted);font-size:.85rem;">Total Recaudado:</span> <strong id="waiterStatRecaudado" style="color:var(--green)">$0</strong></div>
+            <div><span style="color:var(--text-muted);font-size:.85rem;">Total Pendiente:</span> <strong id="waiterStatPendiente" style="color:var(--red)">$0</strong></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- INVENTARIO -->
+      <div id="secInventario" class="admin-section">
+        <div class="section-title">📦 INVENTARIO</div>
+        <div class="card">
+          <div class="card-title">Agregar Artículo</div>
+          <div class="form-grid">
+            <div class="form-group">
+              <label>Nombre del Artículo</label>
+              <input type="text" id="invName" placeholder="Nombre">
+            </div>
+            <div class="form-group">
+              <label>Categoría</label>
+              <select id="invCat">
+                <option value="cervezas">🍺 Cervezas</option>
+                <option value="bebidas">🥤 Bebidas</option>
+                <option value="botellas">🍾 Botellas</option>
+                <option value="mecatos">🍟 Mecatos</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Valor de Venta ($)</label>
+              <input type="number" id="invPrice" placeholder="0">
+            </div>
+            <div class="form-group">
+              <label>Cantidad en Stock</label>
+              <input type="number" id="invQty" placeholder="0">
+            </div>
+            <div class="form-group" style="grid-column:1/-1;">
+              <label>Imagen del Producto</label>
+              <input type="file" id="invImg" accept="image/*" onchange="previewInvImg(this)">
+              <div id="invImgPreview" class="img-preview" style="margin-top:8px;">📷</div>
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="addInventoryItem()">+ AGREGAR ARTÍCULO</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Cargar desde Excel</div>
+          <input type="file" id="excelFile" accept=".xlsx,.xls,.csv">
+          <p class="excel-info">El archivo debe tener columnas: nombre, categoria, precio, cantidad</p>
+          <button class="btn btn-secondary" style="margin-top:10px;" onclick="loadExcel()">📊 CARGAR EXCEL</button>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Artículos en Inventario</div>
+          <div style="display:flex;gap:10px;margin-bottom:12px;">
+            <input type="text" id="invSearch" placeholder="Buscar artículo..." style="flex:1;background:var(--dark4);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:4px;outline:none;" oninput="renderInventory()">
+          </div>
+          <div class="data-table-wrapper"><table class="data-table" id="inventoryTable">
+            <thead><tr><th>Img</th><th>Nombre</th><th>Categoría</th><th>Precio</th><th>Stock</th><th>Acciones</th></tr></thead>
+            <tbody id="inventoryTbody"></tbody>
+          </table></div>
+        </div>
+      </div>
+
+      <!-- RECAUDOS -->
+      <div id="secRecaudos" class="admin-section">
+        <div class="section-title">💰 RECAUDOS</div>
+        <div class="card">
+          <div class="card-title">Registrar Recaudo</div>
+          <div class="form-grid">
+            <div class="form-group">
+              <label>Mesero</label>
+              <select id="recMesero">
+                <option value="">— Seleccionar —</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Tipo de Pago</label>
+              <select id="recTipo">
+                <option value="efectivo">💵 Efectivo</option>
+                <option value="transferencia">📱 Transferencia</option>
+              </select>
+            </div>
+            <div class="form-group" style="grid-column:1/-1;">
+              <label>Monto ($)</label>
+              <input type="number" id="recMonto" placeholder="0">
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="addRecaudo()">💰 REGISTRAR RECAUDO</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Historial de Recaudos</div>
+          <div class="data-table-wrapper"><table class="data-table">
+            <thead><tr><th>Fecha</th><th>Mesero</th><th>Tipo</th><th>Monto</th></tr></thead>
+            <tbody id="recaudosTbody"></tbody>
+          </table></div>
+          <div style="margin-top:12px;display:flex;gap:16px;">
+            <div><span style="color:var(--text-muted);font-size:.85rem;">Total Efectivo:</span> <strong id="totalEfectivo" style="color:var(--green)">$0</strong></div>
+            <div><span style="color:var(--text-muted);font-size:.85rem;">Total Transferencias:</span> <strong id="totalTransferencia" style="color:var(--blue)">$0</strong></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- GASTOS -->
+      <div id="secGastos" class="admin-section">
+        <div class="section-title">📤 GASTOS</div>
+        <div class="card">
+          <div class="card-title">Registrar Gasto</div>
+          <div class="form-grid">
+            <div class="form-group" style="grid-column:1/-1;">
+              <label>Descripción del Gasto</label>
+              <input type="text" id="gastoDesc" placeholder="Descripción">
+            </div>
+            <div class="form-group">
+              <label>Valor ($)</label>
+              <input type="number" id="gastoValor" placeholder="0">
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="addGasto()">+ REGISTRAR GASTO</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">Historial de Gastos</div>
+          <div class="data-table-wrapper"><table class="data-table">
+            <thead><tr><th>Fecha</th><th>Descripción</th><th>Valor</th><th>Acciones</th></tr></thead>
+            <tbody id="gastosTbody"></tbody>
+          </table></div>
+          <div style="margin-top:12px;">
+            <span style="color:var(--text-muted);font-size:.85rem;">Total Gastos:</span>
+            <strong id="totalGastos" style="color:var(--red)">$0</strong>
+          </div>
+        </div>
+      </div>
+
+      <!-- HISTORIAL PEDIDOS -->
+      <div id="secHistorial" class="admin-section">
+        <div class="section-title">📑 HISTORIAL DE PEDIDOS</div>
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-label">Total Ventas</div>
+            <div class="stat-value" id="statVentas">$0</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Pedidos Hoy</div>
+            <div class="stat-value" id="statPedidos">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Recaudado</div>
+            <div class="stat-value" id="statRecaudado">$0</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Gastos</div>
+            <div class="stat-value" id="statGastos">$0</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">Pedidos Registrados</div>
+          <div class="data-table-wrapper"><table class="data-table">
+            <thead><tr><th>ID</th><th>Fecha/Hora</th><th>Mesero</th><th>Items</th><th>Total</th><th>Acciones</th></tr></thead>
+            <tbody id="orderHistoryTbody"></tbody>
+          </table></div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════
+     MÓDULO MIS CLIENTES (mesero)
+═══════════════════════════════════ -->
+<div id="modMisclientes" class="module">
+  <div class="admin-layout" style="width:100%;height:100%;">
+    <div class="admin-content" style="flex:1;overflow-y:auto;">
+      <div class="section-title" id="misClientesTitle">🧑‍🤝‍🧑 MIS CLIENTES</div>
+
+      <!-- ESTADO DE CUENTA DEL MESERO -->
+      <div class="card" id="misWaiterAccountCard" style="border-color:rgba(212,168,67,0.4);background:rgba(212,168,67,0.04);">
+        <div class="card-title" style="display:flex;align-items:center;gap:8px;">
+          <span id="misWaiterAccountName">📊 MI ESTADO DE CUENTA</span>
+        </div>
+        <div id="misWaiterAccountGrid" style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:12px;"></div>
+        <div id="misWaiterAccountBanner"></div>
+      </div>
+
+      <!-- CLIENTES ATENDIDOS -->
+      <div class="card">
+        <div class="card-title">Estado de Cuenta — Clientes Atendidos</div>
+        <div style="display:flex;gap:10px;margin-bottom:12px;">
+          <input type="text" id="misClientSearch" placeholder="Buscar cliente..." style="flex:1;background:var(--dark4);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:4px;outline:none;" oninput="renderMisClientes()">
+        </div>
+        <div class="data-table-wrapper"><table class="data-table">
+          <thead><tr><th>#</th><th>Nombre</th><th>Contacto</th><th>Código</th><th>Pedidos</th><th>Total</th><th>Recaudado</th><th>Pendiente</th><th>Ver</th></tr></thead>
+          <tbody id="misClientesTbody"></tbody>
+        </table></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</main>
+
+<!-- MODAL EDITAR PRODUCTO -->
+<div class="modal-overlay hidden" id="editModal">
+  <div class="modal">
+    <h3>✏️ EDITAR ARTÍCULO</h3>
+    <input type="hidden" id="editId">
+    <div class="form-group">
+      <label>Nombre</label>
+      <input type="text" id="editName">
+    </div>
+    <div class="form-group">
+      <label>Categoría</label>
+      <select id="editCat">
+        <option value="cervezas">🍺 Cervezas</option>
+        <option value="bebidas">🥤 Bebidas</option>
+        <option value="botellas">🍾 Botellas</option>
+        <option value="mecatos">🍟 Mecatos</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Precio ($)</label>
+      <input type="number" id="editPrice">
+    </div>
+    <div class="form-group">
+      <label>Stock</label>
+      <input type="number" id="editQty">
+    </div>
+    <div class="form-group">
+      <label>Imagen</label>
+      <input type="file" id="editImg" accept="image/*" onchange="previewEditImg(this)">
+      <div id="editImgPreview" class="img-preview" style="margin-top:8px;">📷</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal('editModal')">Cancelar</button>
+      <button class="btn btn-primary" onclick="saveEdit()">GUARDAR</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL NUEVO CLIENTE -->
+<div class="modal-overlay hidden" id="newCustomerModal">
+  <div class="modal" style="min-width:340px;max-width:460px;">
+    <h3>🧑‍🤝‍🧑 NUEVO CLIENTE</h3>
+    <div class="form-group">
+      <label>Nombre del Cliente</label>
+      <input type="text" id="newClientName" placeholder="Nombre completo">
+    </div>
+    <div class="form-group">
+      <label>Teléfono / Nota (opcional)</label>
+      <input type="text" id="newClientContact" placeholder="Tel, mesa, referencia...">
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal('newCustomerModal')">Cancelar</button>
+      <button class="btn btn-primary" onclick="saveNewCustomer()">+ CREAR CLIENTE</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL ESTADO DE CUENTA CLIENTE (admin/mesero) -->
+<div class="modal-overlay hidden" id="clientAccountModal">
+  <div class="modal" style="min-width:340px;max-width:540px;">
+    <h3 id="camClientName" style="margin-bottom:4px;">📊 ESTADO DE CUENTA</h3>
+    <p id="camClientInfo" style="color:var(--text-muted);font-size:.82rem;margin-bottom:14px;"></p>
+    <div id="camSummaryGrid" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px;"></div>
+    <div id="camPendBanner" style="margin-bottom:14px;"></div>
+    <!-- Sección Pedidos -->
+    <div style="font-family:'Barlow Condensed',sans-serif;font-size:.82rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--text-muted);margin-bottom:8px;">📋 PEDIDOS</div>
+    <div id="camOrdersList" style="max-height:240px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;margin-bottom:14px;"></div>
+    <!-- Sección Recaudos -->
+    <div style="font-family:'Barlow Condensed',sans-serif;font-size:.82rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--text-muted);margin-bottom:8px;">💵 PAGOS RECIBIDOS</div>
+    <div id="camRecaudosList" style="max-height:160px;overflow-y:auto;display:flex;flex-direction:column;gap:5px;"></div>
+    <div class="modal-actions" style="justify-content:flex-end;margin-top:16px;">
+      <button class="btn btn-secondary" onclick="closeModal('clientAccountModal')">Cerrar</button>
+    </div>
+  </div>
+</div>
+
+<!-- PORTAL CLIENTE — Pantalla completa de estado de cuenta -->
+<div id="clientPortalScreen" style="display:none;position:fixed;inset:0;background:linear-gradient(135deg,#0D0D0D 0%,#1a1200 50%,#0D0D0D 100%);z-index:9998;overflow-y:auto;padding:0 0 40px;">
+  <div style="max-width:480px;margin:0 auto;padding:0 16px;">
+    <div style="text-align:center;padding:28px 0 16px;border-bottom:2px solid rgba(212,168,67,.3);margin-bottom:16px;">
+      <div style="font-size:2.5rem;margin-bottom:6px;">🍺</div>
+      <div style="font-family:'Bebas Neue',sans-serif;font-size:1.8rem;color:var(--gold);letter-spacing:4px;">TERRAZA LOS CADENAS</div>
+      <div style="font-size:.8rem;color:var(--text-muted);letter-spacing:3px;text-transform:uppercase;margin-top:4px;">Estado de Cuenta</div>
+    </div>
+    <div id="cpClientCard" style="background:rgba(212,168,67,.08);border:1px solid rgba(212,168,67,.25);border-radius:12px;padding:14px 16px;display:flex;align-items:center;gap:12px;margin-bottom:14px;">
+      <div id="cpAvatar" style="width:46px;height:46px;background:var(--gold);color:#0D0D0D;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.4rem;font-weight:700;flex-shrink:0;"></div>
+      <div>
+        <div id="cpName" style="font-size:1.1rem;font-weight:700;"></div>
+        <div id="cpContact" style="font-size:.8rem;color:var(--text-muted);margin-top:2px;"></div>
+        <div id="cpCode" style="font-size:.75rem;color:var(--gold);font-family:'Roboto Mono',monospace;margin-top:2px;letter-spacing:2px;"></div>
+      </div>
+    </div>
+    <div id="cpSummaryGrid" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px;"></div>
+    <div id="cpBanner" style="margin-bottom:12px;"></div>
+    <div style="font-family:'Barlow Condensed',sans-serif;font-size:.82rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--text-muted);margin-bottom:8px;">📋 MIS PEDIDOS</div>
+    <div id="cpOrdersList" style="display:flex;flex-direction:column;gap:7px;"></div>
+    <div style="text-align:center;margin-top:24px;">
+      <button onclick="closeClientPortal()" style="background:var(--dark3);border:1px solid var(--border);color:var(--text-muted);padding:12px 28px;border-radius:8px;font-size:.9rem;font-weight:600;cursor:pointer;letter-spacing:1px;">← SALIR</button>
+    </div>
+  </div>
+</div>
+
+<!-- PRINT AREA -->
+<div id="printArea" class="hidden"></div>
+
+<script>
+{
+// ══════════════════════════════════════════════
+// STATE
+// ══════════════════════════════════════════════
+const ADMIN_PW = '0317';
+let appLocked = true;
+let adminUnlocked = false;
+let baseCaja = (() => { try { const v = parseFloat(localStorage.getItem('posBaseCaja')); return isNaN(v) ? 0 : v; } catch { return 0; } })();  // base de caja del turno
+let currentWaiterSession = null; // { id, name } si entró como mesero, null si es admin
+
+// Flag: el lockScreen solo aparece si se ha cerrado turno previamente
+// En la primera apertura (sin cierre previo), se salta la pantalla de inicio de turno
+function getTurnoCerrado() {
+  try { return localStorage.getItem('turnoCerrado') === 'true'; } catch { return false; }
+}
+function setTurnoCerrado(val) {
+  try { localStorage.setItem('turnoCerrado', val ? 'true' : 'false'); } catch {}
+}
+
+let state = loadState() || {
+  inventory: [
+    { id: 1,  name: 'ESTRELLA GALICIA',         cat: 'cervezas', price: 12000,  qty: 500, img: null },
+    { id: 2,  name: 'PAULANER NATURTRU',         cat: 'cervezas', price: 20000,  qty: 500, img: null },
+    { id: 3,  name: 'MILLER LITE',               cat: 'cervezas', price: 4000,   qty: 500, img: null },
+    { id: 4,  name: 'LIKE',                      cat: 'cervezas', price: 7000,   qty: 500, img: null },
+    { id: 5,  name: 'HEINEKEN VIDRIO',           cat: 'cervezas', price: 4000,   qty: 500, img: null },
+    { id: 6,  name: 'REDDS',                     cat: 'cervezas', price: 4000,   qty: 500, img: null },
+    { id: 7,  name: 'CLUB COLOMBIA DORADA',      cat: 'cervezas', price: 5000,   qty: 500, img: null },
+    { id: 8,  name: 'CLUB COLOMBIA TRIGO',       cat: 'cervezas', price: 5000,   qty: 500, img: null },
+    { id: 9,  name: 'CORONA EXTRA',              cat: 'cervezas', price: 8000,   qty: 500, img: null },
+    { id: 10, name: 'AGUILA LIGHT BOTELLA',      cat: 'cervezas', price: 4000,   qty: 500, img: null },
+    { id: 11, name: 'MODELO',                    cat: 'cervezas', price: 10000,  qty: 500, img: null },
+    { id: 12, name: 'BUDWEISER',                 cat: 'cervezas', price: 4000,   qty: 500, img: null },
+    { id: 13, name: 'COSTEÑA',                   cat: 'cervezas', price: 4000,   qty: 500, img: null },
+    { id: 14, name: 'AGUILA LIGHT LATA',         cat: 'cervezas', price: 4000,   qty: 500, img: null },
+    { id: 15, name: 'CORONITA EXTRA',            cat: 'cervezas', price: 4000,   qty: 500, img: null },
+    { id: 16, name: 'AGUILA ORIGINAL LATA',      cat: 'cervezas', price: 4000,   qty: 500, img: null },
+    { id: 17, name: 'POKER LATA',                cat: 'cervezas', price: 4000,   qty: 500, img: null },
+    { id: 18, name: 'PANCHITA ANTIOQUEÑO',       cat: 'botellas', price: 30000,  qty: 500, img: null },
+    { id: 19, name: 'RON MEDELLÍN 12 AÑOS',      cat: 'botellas', price: 120000, qty: 500, img: null },
+    { id: 20, name: 'AGUARDIENTE CHORRITO',      cat: 'botellas', price: 60000,  qty: 500, img: null },
+    { id: 21, name: 'AGUARDIENTE REAL PREMIUM',  cat: 'botellas', price: 100000, qty: 500, img: null },
+    { id: 22, name: 'DON JULIO 750',             cat: 'botellas', price: 400000, qty: 500, img: null },
+    { id: 23, name: 'FAMOUS RON',                cat: 'botellas', price: 100000, qty: 500, img: null },
+    { id: 24, name: 'RON CALDAS CARTA DE ORO',   cat: 'botellas', price: 138000, qty: 500, img: null },
+    { id: 25, name: 'RON CALDAS GRAN RESERVA',   cat: 'botellas', price: 170000, qty: 500, img: null },
+    { id: 26, name: 'SMIRNOFF VODKA',            cat: 'botellas', price: 70000,  qty: 500, img: null },
+    { id: 27, name: 'MEDELLIN 8 AÑOS',           cat: 'botellas', price: 110000, qty: 500, img: null },
+    { id: 28, name: 'SELLO NEGRO WHISKEY',       cat: 'botellas', price: 180000, qty: 500, img: null },
+    { id: 29, name: 'RON MEDELLIN DORADO',       cat: 'botellas', price: 80000,  qty: 500, img: null },
+    { id: 30, name: 'BUCHANANS MASTER 1L',       cat: 'botellas', price: 280000, qty: 500, img: null },
+    { id: 31, name: 'AGUARDIENTE TETRA',         cat: 'botellas', price: 90000,  qty: 500, img: null },
+    { id: 32, name: 'BUCHANANS DELUXE 1L',       cat: 'botellas', price: 240000, qty: 500, img: null },
+    { id: 33, name: 'BLACK & WHITE',             cat: 'botellas', price: 100000, qty: 500, img: null },
+    { id: 34, name: 'OLD PARR',                  cat: 'botellas', price: 180000, qty: 500, img: null },
+    { id: 35, name: 'OLD PARR TRIBUTE',          cat: 'botellas', price: 155000, qty: 500, img: null },
+    { id: 36, name: 'RON CALDAS 12 AÑOS',        cat: 'botellas', price: 80000,  qty: 500, img: null },
+    { id: 37, name: 'AGUARDIENTE AMARILLO',      cat: 'botellas', price: 80000,  qty: 500, img: null },
+    { id: 38, name: 'APERITIVO JP CHENET',       cat: 'botellas', price: 12000,  qty: 500, img: null },
+    { id: 39, name: 'AGUA LIMONADA H2OH',        cat: 'bebidas',  price: 4000,   qty: 500, img: null },
+    { id: 40, name: 'RED BULL',                  cat: 'bebidas',  price: 8000,   qty: 500, img: null },
+    { id: 41, name: 'GASEOSA POSTOBON',          cat: 'bebidas',  price: 4000,   qty: 500, img: null },
+    { id: 42, name: 'ELECTROLYT',                cat: 'bebidas',  price: 10000,  qty: 500, img: null },
+    { id: 43, name: 'AGUA CRISTAL CON GAS',      cat: 'bebidas',  price: 4000,   qty: 500, img: null },
+    { id: 44, name: 'COLA Y POLA',               cat: 'bebidas',  price: 4000,   qty: 500, img: null },
+    { id: 45, name: 'PONY MALTA',                cat: 'bebidas',  price: 4000,   qty: 500, img: null },
+    { id: 46, name: 'SPEED MAX',                 cat: 'bebidas',  price: 3000,   qty: 500, img: null },
+    { id: 47, name: 'HIDRALYTE',                 cat: 'bebidas',  price: 5000,   qty: 500, img: null },
+    { id: 48, name: 'DORITO MEGA QUESO',         cat: 'mecatos',  price: 10000,  qty: 500, img: null },
+    { id: 49, name: 'DE TODITO BBQ',             cat: 'mecatos',  price: 7000,   qty: 500, img: null },
+    { id: 50, name: 'DE TODITO BBQ 165G',        cat: 'mecatos',  price: 10000,  qty: 500, img: null },
+    { id: 51, name: 'BONFIEST PLUS',             cat: 'mecatos',  price: 4000,   qty: 500, img: null },
+    { id: 52, name: 'PAPA MARGARITA',            cat: 'mecatos',  price: 10000,  qty: 500, img: null },
+    { id: 53, name: 'DETODITO NATURA 165G',      cat: 'mecatos',  price: 10000,  qty: 500, img: null },
+    { id: 54, name: 'DETODITO NATURA 100G',      cat: 'mecatos',  price: 7000,   qty: 500, img: null },
+    { id: 55, name: 'DETODITO MIX 165G',         cat: 'mecatos',  price: 10000,  qty: 500, img: null },
+    { id: 56, name: 'DETODITO MIX 100G',         cat: 'mecatos',  price: 7000,   qty: 500, img: null },
+    { id: 57, name: 'TRIDENT',                   cat: 'mecatos',  price: 3000,   qty: 500, img: null },
+    { id: 58, name: 'CHICLES TUMIX',             cat: 'mecatos',  price: 500,    qty: 500, img: null },
+  ],
+  waiters: [
+    { id: 1, name: 'Carlos', username: 'carlos', password: '1234' },
+    { id: 2, name: 'María',  username: 'maria',  password: '1234' },
+  ],
+  orders: [],
+  recaudos: [],
+  gastos: [],
+  customers: [],
+  nextId: 200,
+};
+
+let currentOrder = (() => {
+  try {
+    const saved = JSON.parse(localStorage.getItem('posCurrentOrder'));
+    if (saved && Array.isArray(saved.items)) return saved;
+  } catch {}
+  return { items: [], waiterId: null };
+})();
+let currentCat = 'all';
+let editImgData = null;
+let invImgData = null;
+
+// ══════════════════════════════════════════════
+// PERSISTENCE
+// ══════════════════════════════════════════════
+function _migrateState(s) {
+  if (!s) return null;
+  if (!s.customers) s.customers = [];
+  s.customers.forEach(c => {
+    if (!c.clientCode) {
+      const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+      let code = '';
+      for (let i = 0; i < 4; i++) code += chars[Math.floor(Math.random() * chars.length)];
+      c.clientCode = code;
+    }
+    delete c.qrToken;
+  });
+  return s;
+}
+
+function loadState() {
+  try {
+    const s = JSON.parse(localStorage.getItem('posState'));
+    return _migrateState(s);
+  } catch { return null; }
+}
+
+function saveState() {
+  try {
+    localStorage.setItem('posState', JSON.stringify(state));
+    localStorage.setItem('posCurrentOrder', JSON.stringify(currentOrder));
+    localStorage.setItem('posBaseCaja', String(baseCaja));
+  } catch {}
+  if (window._firebase && window._firebase.ready) {
+    // Guardar estado general (pedidos, meseros, clientes…)
+    window._firebase.saveState(state, currentOrder).catch(() => {});
+    // Guardar inventario en documento dedicado para sync inmediata
+    window._firebase.saveInventory(state.inventory).catch(() => {});
+  }
+}
+
+// Variante liviana: solo sincroniza el inventario (stock, precios, orden)
+// Se llama desde cualquier operación que modifique state.inventory
+function saveInventory() {
+  try { localStorage.setItem('posState', JSON.stringify(state)); } catch {}
+  if (window._firebase && window._firebase.ready) {
+    window._firebase.saveInventory(state.inventory).catch(() => {});
+  }
+}
+
+// ══════════════════════════════════════════════
+// CALLBACKS TIEMPO REAL DESDE FIREBASE
+// ══════════════════════════════════════════════
+
+// Inventario: aplica inmediatamente sin verificar versión
+window._posApplyInventory = function(items) {
+  if (!items || !Array.isArray(items)) return;
+  // Preservar imágenes locales que no se suben a Firestore
+  const merged = items.map(fi => {
+    const local = (state.inventory || []).find(i => i.id === fi.id);
+    return { ...fi, img: fi.img || (local ? local.img : null) };
+  });
+  state.inventory = merged;
+  try { localStorage.setItem('posState', JSON.stringify(state)); } catch {}
+  renderProducts();
+  renderInventory();
+  // Indicador visual pulsante
+  const el = document.getElementById('fbStatusIndicator');
+  if (el) {
+    el.textContent = '🔥 Inventario ↺';
+    el.style.color = '#F5A623';
+    clearTimeout(window._fbIndicatorTimer);
+    window._fbIndicatorTimer = setTimeout(() => {
+      if (el) { el.textContent = '🔥 Firebase ✓'; }
+    }, 2000);
+  }
+};
+
+// Estado general (pedidos, clientes, meseros, etc.)
+window._posApplyState = function(data) {
+  if (appLocked || !data) return;
+  const migratedData = _migrateState({ ...data, inventory: state.inventory }); // conservar inventario local
+  if (!migratedData) return;
+  Object.assign(state, migratedData);
+  try { localStorage.setItem('posState', JSON.stringify(state)); } catch {}
+  renderAll();
+};
+
+// Pedido activo
+window._posApplyCurrentOrder = function(data) {
+  if (appLocked || !data || !Array.isArray(data.items)) return;
+  if (currentOrder.items && currentOrder.items.length > 0) return; // no sobreescribir
+  Object.assign(currentOrder, data);
+  renderOrderPanel();
+};
+
+// ══════════════════════════════════════════════
+// INIT FIREBASE AL ARRANQUE
+// ══════════════════════════════════════════════
+async function _initFromFirebase() {
+  if (!window._firebase || !window._firebase.ready) return;
+  const el = document.getElementById('fbStatusIndicator');
+  try {
+    if (el) { el.textContent = '🔥 Conectando...'; el.style.color = '#F5A623'; }
+
+    // 1. Cargar inventario desde Firestore (documento dedicado)
+    const fbInventory = await window._firebase.loadInventory();
+    if (fbInventory && fbInventory.length > 0) {
+      // Merge: usar Firestore como fuente de verdad para inventario
+      const merged = fbInventory.map(fi => {
+        const local = (state.inventory || []).find(i => i.id === fi.id);
+        return { ...fi, img: fi.img || (local ? local.img : null) };
+      });
+      state.inventory = merged;
+      try { localStorage.setItem('posState', JSON.stringify(state)); } catch {}
+      renderProducts();
+      renderInventory();
+    } else {
+      // Primera vez: subir inventario local a Firestore
+      await window._firebase.saveInventory(state.inventory).catch(() => {});
+    }
+
+    // 2. Cargar estado general
+    const fbState = await window._firebase.loadState();
+    if (fbState) {
+      const migrated = _migrateState({ ...fbState, inventory: state.inventory });
+      const localNextId = state.nextId || 0;
+      if (migrated && (migrated.nextId || 0) > localNextId) {
+        Object.assign(state, migrated);
+        try { localStorage.setItem('posState', JSON.stringify(state)); } catch {}
+        renderAll();
+      }
+    } else {
+      // Primera vez: subir estado completo
+      await window._firebase.saveState(state, currentOrder).catch(() => {});
+    }
+
+    // 3. Cargar pedido activo
+    const fbOrder = await window._firebase.loadCurrentOrder();
+    if (fbOrder && Array.isArray(fbOrder.items) && fbOrder.items.length > 0) {
+      if (!currentOrder.items || currentOrder.items.length === 0) {
+        Object.assign(currentOrder, fbOrder);
+        renderOrderPanel();
+      }
+    }
+
+    // 4. Iniciar escuchas en tiempo real
+    window._firebase.startRealtime();
+
+    if (el) { el.textContent = '🔥 Firebase ✓'; el.style.color = '#F5A623'; }
+    window._firebase.logEvent('app_opened', { session_type: 'pos' });
+
+  } catch (e) {
+    console.warn('[Firebase] Error en init:', e);
+    if (el) { el.textContent = '⚠️ Sin nube'; el.style.color = 'var(--text-muted)'; }
+  }
+}
+
+setTimeout(_initFromFirebase, 800);
+
+// ══════════════════════════════════════════════
+// LOCK / UNLOCK
+// ══════════════════════════════════════════════
+
+// ── Pantalla de selección de tipo ────────────
+function lockSelectType(type) {
+  document.getElementById('lockStep1').style.display = 'none';
+  if (type === 'admin') {
+    document.getElementById('lockStep2Admin').style.display = 'flex';
+    // Solo pedir base de caja en el primer inicio de turno (turno cerrado o primera vez)
+    const esTurnoNuevo = getTurnoCerrado() || !localStorage.getItem('posState');
+    const wrapper = document.getElementById('baseCajaWrapper');
+    const btn = document.getElementById('lockAdminBtn');
+    if (esTurnoNuevo) {
+      wrapper.style.display = '';
+      btn.textContent = 'INICIAR TURNO';
+      setTimeout(() => document.getElementById('baseInput').focus(), 100);
+    } else {
+      wrapper.style.display = 'none';
+      document.getElementById('baseInput').value = '';
+      btn.textContent = 'DESBLOQUEAR';
+      setTimeout(() => document.getElementById('lockPwInput').focus(), 100);
+    }
+  } else if (type === 'mesero') {
+    document.getElementById('lockStep2Mesero').style.display = 'flex';
+    document.getElementById('lockMeseroUser').value = '';
+    document.getElementById('lockMeseroPw').value = '';
+    document.getElementById('lockMeseroErrMsg').textContent = '';
+    setTimeout(() => document.getElementById('lockMeseroUser').focus(), 100);
+  } else if (type === 'cliente') {
+    document.getElementById('lockStep2Cliente').style.display = 'flex';
+    document.getElementById('lockClientCode').value = '';
+    document.getElementById('lockClientErrMsg').textContent = '';
+    setTimeout(() => document.getElementById('lockClientCode').focus(), 100);
+  }
+}
+
+function lockGoBack() {
+  document.getElementById('lockStep2Admin').style.display = 'none';
+  document.getElementById('lockStep2Mesero').style.display = 'none';
+  document.getElementById('lockStep2Cliente').style.display = 'none';
+  document.getElementById('lockStep1').style.display = 'flex';
+  document.getElementById('lockErrMsg').textContent = '';
+  document.getElementById('lockMeseroErrMsg').textContent = '';
+  if (document.getElementById('lockClientErrMsg')) document.getElementById('lockClientErrMsg').textContent = '';
+}
+
+// ── Ir siempre a ventas al iniciar sesión ─────
+function goToVentas() {
+  document.querySelectorAll('.module').forEach(m => m.classList.remove('active'));
+  document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('modVentas').classList.add('active');
+  const ventasTab = document.querySelector('.nav-tab[onclick*="ventas"]');
+  if (ventasTab) ventasTab.classList.add('active');
+}
+
+// ── Admin unlock ──────────────────────────────
+function unlockApp() {
+  const wrapper = document.getElementById('baseCajaWrapper');
+  const esTurnoNuevo = wrapper && wrapper.style.display !== 'none';
+  const pw = document.getElementById('lockPwInput').value;
+  const err = document.getElementById('lockErrMsg');
+  if (esTurnoNuevo) {
+    const base = parseFloat(document.getElementById('baseInput').value);
+    if (isNaN(base) || base < 0) { err.textContent = 'Ingresa un valor de base válido'; return; }
+    baseCaja = base;
+  }
+  if (pw !== ADMIN_PW) { err.textContent = 'Contraseña de administrador incorrecta'; document.getElementById('lockPwInput').value=''; return; }
+  appLocked = false;
+  currentWaiterSession = null;
+  setTurnoCerrado(false);
+  document.getElementById('lockScreen').style.display = 'none';
+  updateHeaderForSession();
+  goToVentas();
+  renderAll();
+}
+
+// ── Mesero unlock ─────────────────────────────
+function unlockAsMesero() {
+  const user = document.getElementById('lockMeseroUser').value.trim().toLowerCase();
+  const pw   = document.getElementById('lockMeseroPw').value;
+  const err  = document.getElementById('lockMeseroErrMsg');
+  if (!user || !pw) { err.textContent = 'Ingresa usuario y contraseña'; return; }
+  const waiter = state.waiters.find(w => (w.username || '').toLowerCase() === user && w.password === pw);
+  if (!waiter) {
+    err.textContent = 'Usuario o contraseña incorrectos';
+    document.getElementById('lockMeseroPw').value = '';
+    return;
+  }
+  appLocked = false;
+  currentWaiterSession = { id: waiter.id, name: waiter.name };
+  setTurnoCerrado(false);
+  document.getElementById('lockScreen').style.display = 'none';
+  updateHeaderForSession();
+  currentOrder.waiterId = waiter.id;
+  goToVentas();
+  renderAll();
+}
+
+// ── Actualizar header según sesión ───────────
+function updateHeaderForSession() {
+  const lbl = document.getElementById('sessionLabel');
+  if (lbl) {
+    if (currentWaiterSession) {
+      lbl.textContent = '👤 ' + currentWaiterSession.name;
+      lbl.style.display = 'inline';
+    } else {
+      lbl.textContent = '🔐 Admin';
+      lbl.style.display = 'inline';
+    }
+  }
+  // Ocultar pestaña Admin si es sesión de mesero; mostrar Mis Clientes
+  const adminTab = document.getElementById('tabAdmin');
+  const misClientesTab = document.getElementById('tabMisClientes');
+  if (adminTab) adminTab.style.display = currentWaiterSession ? 'none' : '';
+  if (misClientesTab) {
+    if (currentWaiterSession) {
+      misClientesTab.classList.remove('hidden');
+    } else {
+      misClientesTab.classList.add('hidden');
+    }
+  }
+}
+
+function renderMisClientes() {
+  const tb = document.getElementById('misClientesTbody');
+  if (!tb) return;
+  const q = (document.getElementById('misClientSearch')?.value || '').toLowerCase();
+
+  // Título
+  const titleEl = document.getElementById('misClientesTitle');
+  if (titleEl) titleEl.textContent = '🧑‍🤝‍🧑 MIS CLIENTES';
+
+  // ── Estado de cuenta del propio mesero ────────
+  const waiterCard   = document.getElementById('misWaiterAccountCard');
+  const waiterGrid   = document.getElementById('misWaiterAccountGrid');
+  const waiterBanner = document.getElementById('misWaiterAccountBanner');
+  const waiterNameEl = document.getElementById('misWaiterAccountName');
+
+  if (!currentWaiterSession) {
+    if (waiterCard)  waiterCard.style.display = 'none';
+    tb.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--text-muted)">Acceso solo para meseros</td></tr>';
+    return;
+  }
+
+  // Calcular estado del mesero
+  if (waiterCard) waiterCard.style.display = '';
+  const wOrders    = (state.orders  || []).filter(o => o.waiterId === currentWaiterSession.id);
+  const wVentas    = wOrders.reduce((s, o) => s + o.total, 0);
+  const wRecaudado = (state.recaudos || []).filter(r => r.waiterId === currentWaiterSession.id).reduce((s, r) => s + r.monto, 0);
+  const wPendiente = Math.max(0, wVentas - wRecaudado);
+  const wP = wPendiente > 0;
+
+  if (waiterNameEl) waiterNameEl.innerHTML = `📊 MI ESTADO DE CUENTA &nbsp;<span style="color:var(--text-muted);font-size:.82rem;font-family:'Barlow Condensed',sans-serif;letter-spacing:1px;">— ${currentWaiterSession.name}</span>`;
+
+  if (waiterGrid) waiterGrid.innerHTML = `
+    <div style="background:var(--dark3);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center;">
+      <div style="font-size:.72rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">Pedidos</div>
+      <div style="font-size:1.15rem;font-weight:700;color:var(--gold);">${wOrders.length}</div>
+    </div>
+    <div style="background:var(--dark3);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center;">
+      <div style="font-size:.72rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">Total Ventas</div>
+      <div style="font-size:1.15rem;font-weight:700;color:var(--gold);">${fmt(wVentas)}</div>
+    </div>
+    <div style="background:var(--dark3);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center;">
+      <div style="font-size:.72rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">Recaudado</div>
+      <div style="font-size:1.15rem;font-weight:700;color:var(--green);">${fmt(wRecaudado)}</div>
+    </div>
+    <div style="background:var(--dark3);border:1px solid ${wP?'rgba(192,57,43,.4)':'rgba(39,174,96,.3)'};border-radius:8px;padding:12px;text-align:center;${wP?'background:rgba(192,57,43,.08);':''}">
+      <div style="font-size:.72rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">Pendiente</div>
+      <div style="font-size:1.15rem;font-weight:700;color:${wP?'var(--red)':'var(--green)'};">${wP ? fmt(wPendiente) : '✔ Al día'}</div>
+    </div>`;
+
+  if (waiterBanner) waiterBanner.innerHTML = wP
+    ? `<div style="background:rgba(192,57,43,.1);border:1px solid rgba(192,57,43,.35);border-radius:7px;padding:9px 13px;font-size:.85rem;color:var(--red);text-align:center;margin-top:8px;">⚠️ Tienes un saldo pendiente de entrega: <strong>${fmt(wPendiente)}</strong></div>`
+    : `<div style="background:rgba(39,174,96,.08);border:1px solid rgba(39,174,96,.3);border-radius:7px;padding:9px 13px;font-size:.85rem;color:var(--green);text-align:center;margin-top:8px;">✅ Estás al día. Sin saldos pendientes.</div>`;
+
+  // ── Clientes atendidos ─────────────────────────
+  const myCustomerIds = new Set(state.orders.filter(o => o.waiterId === currentWaiterSession.id && o.customerId).map(o => o.customerId));
+  const customers = (state.customers || []).filter(c =>
+    myCustomerIds.has(c.id) &&
+    (!q || c.name.toLowerCase().includes(q) || (c.contact||'').toLowerCase().includes(q) || (c.clientCode||'').toLowerCase().includes(q))
+  );
+
+  if (!customers.length) {
+    tb.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--text-muted)">No tienes clientes atendidos aún</td></tr>';
+    return;
+  }
+  tb.innerHTML = customers.map((c, i) => {
+    const cOrders = (state.orders || []).filter(o => o.customerId === c.id);
+    const totalVentas = cOrders.reduce((s, o) => s + o.total, 0);
+    const recaudado = (state.recaudos || []).filter(r => r.customerId === c.id).reduce((s, r) => s + r.monto, 0);
+    const pendiente = Math.max(0, totalVentas - recaudado);
+    const pendClass = pendiente > 0 ? 'color:var(--red)' : 'color:var(--green)';
+    return `<tr>
+      <td>${i + 1}</td>
+      <td><strong>${c.name}</strong></td>
+      <td style="color:var(--text-muted);font-size:.8rem;">${c.contact || '—'}</td>
+      <td><span class="badge badge-blue" style="font-family:'Roboto Mono',monospace;letter-spacing:2px;">${c.clientCode || '—'}</span></td>
+      <td><span class="badge badge-gold">${cOrders.length}</span></td>
+      <td style="color:var(--gold);font-weight:700;">${fmt(totalVentas)}</td>
+      <td style="color:var(--green);font-weight:600;">${fmt(recaudado)}</td>
+      <td style="${pendClass};font-weight:700;">${pendiente > 0 ? fmt(pendiente) : '✔ Al día'}</td>
+      <td><button class="btn btn-info" style="font-size:.75rem;padding:5px 8px;" onclick="showClientAccount(${c.id})">📊 Ver</button></td>
+    </tr>`;
+  }).join('');
+}
+
+function lockApp() {
+  adminUnlocked = false;
+  currentWaiterSession = null;
+  const rs = document.getElementById('relockScreen');
+  rs.style.display = 'flex';
+  document.getElementById('relockInput').value = '';
+  document.getElementById('relockErrMsg').textContent = '';
+  // Restaurar textos del relockScreen
+  const relockTitle = document.querySelector('#relockScreen h2');
+  if (relockTitle) relockTitle.textContent = 'APP BLOQUEADA';
+  const relockDesc = document.querySelector('#relockScreen > p');
+  if (relockDesc) relockDesc.textContent = 'Selecciona tu tipo de acceso';
+  // Mostrar selector de tipo en relock también
+  document.getElementById('relockTypeSelect').style.display = 'flex';
+  document.getElementById('relockAdminForm').style.display = 'none';
+  document.getElementById('relockMeseroForm').style.display = 'none';
+}
+
+function relockSelectType(type) {
+  document.getElementById('relockTypeSelect').style.display = 'none';
+  if (type === 'admin') {
+    document.getElementById('relockAdminForm').style.display = 'flex';
+    setTimeout(() => document.getElementById('relockInput').focus(), 100);
+  } else if (type === 'mesero') {
+    document.getElementById('relockMeseroForm').style.display = 'flex';
+    document.getElementById('relockMeseroUser').value = '';
+    document.getElementById('relockMeseroPw').value = '';
+    document.getElementById('relockMeseroErrMsg').textContent = '';
+    setTimeout(() => document.getElementById('relockMeseroUser').focus(), 100);
+  } else if (type === 'cliente') {
+    document.getElementById('relockClienteForm').style.display = 'flex';
+    document.getElementById('relockClientCode').value = '';
+    document.getElementById('relockClientErrMsg').textContent = '';
+    setTimeout(() => document.getElementById('relockClientCode').focus(), 100);
+  }
+}
+
+function relockGoBack() {
+  document.getElementById('relockAdminForm').style.display = 'none';
+  document.getElementById('relockMeseroForm').style.display = 'none';
+  document.getElementById('relockClienteForm').style.display = 'none';
+  document.getElementById('relockTypeSelect').style.display = 'flex';
+  document.getElementById('relockErrMsg').textContent = '';
+  document.getElementById('relockMeseroErrMsg').textContent = '';
+  if (document.getElementById('relockClientErrMsg')) document.getElementById('relockClientErrMsg').textContent = '';
+}
+
+function reUnlockApp() {
+  const v = document.getElementById('relockInput').value;
+  if (v === ADMIN_PW) {
+    currentWaiterSession = null;
+    document.getElementById('relockScreen').style.display = 'none';
+    document.getElementById('relockInput').value = '';
+    // Restaurar textos originales del relockScreen por si fueron modificados
+    const relockTitle = document.querySelector('#relockScreen h2');
+    if (relockTitle) relockTitle.textContent = 'APP BLOQUEADA';
+    const relockDesc = document.querySelector('#relockScreen > p');
+    if (relockDesc) relockDesc.textContent = 'Selecciona tu tipo de acceso';
+    updateHeaderForSession();
+    goToVentas();
+    renderAll();
+  } else {
+    document.getElementById('relockErrMsg').textContent = 'Contraseña incorrecta';
+    document.getElementById('relockInput').value = '';
+  }
+}
+
+function reUnlockAsMesero() {
+  const user = document.getElementById('relockMeseroUser').value.trim().toLowerCase();
+  const pw   = document.getElementById('relockMeseroPw').value;
+  const err  = document.getElementById('relockMeseroErrMsg');
+  const waiter = state.waiters.find(w => (w.username || '').toLowerCase() === user && w.password === pw);
+  if (!waiter) {
+    err.textContent = 'Usuario o contraseña incorrectos';
+    document.getElementById('relockMeseroPw').value = '';
+    return;
+  }
+  currentWaiterSession = { id: waiter.id, name: waiter.name };
+  document.getElementById('relockScreen').style.display = 'none';
+  updateHeaderForSession();
+  currentOrder.waiterId = waiter.id;
+  goToVentas();
+  renderAll();
+}
+
+function unlockAdmin() {
+  const v = document.getElementById('adminPwInput').value;
+  if (v === ADMIN_PW) {
+    adminUnlocked = true;
+    document.getElementById('adminLock').style.display = 'none';
+    document.getElementById('adminPwInput').value = '';
+    document.getElementById('adminErrMsg').textContent = '';
+    renderAll();
+  } else {
+    document.getElementById('adminErrMsg').textContent = 'Contraseña incorrecta';
+    document.getElementById('adminPwInput').value = '';
+  }
+}
+
+// ══════════════════════════════════════════════
+// MODULE SWITCH
+// ══════════════════════════════════════════════
+function switchModule(mod) {
+  document.querySelectorAll('.module').forEach(m => m.classList.remove('active'));
+  document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('mod' + cap(mod)).classList.add('active');
+  event.target.classList.add('active');
+  if (mod === 'admin') {
+    // always require password when entering admin
+    adminUnlocked = false;
+    document.getElementById('adminLock').style.display = 'flex';
+    document.getElementById('adminPwInput').value = '';
+    document.getElementById('adminErrMsg').textContent = '';
+    setTimeout(() => document.getElementById('adminPwInput').focus(), 100);
+  }
+  renderAll();
+}
+function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
+
+function adminNav(sec) {
+  document.querySelectorAll('.admin-nav-item').forEach(i => i.classList.remove('active'));
+  document.querySelectorAll('.admin-section').forEach(s => s.classList.remove('active'));
+  document.querySelector(`[data-sec="${sec}"]`).classList.add('active');
+  document.getElementById('sec' + cap(sec)).classList.add('active');
+  renderAll();
+}
+
+// ══════════════════════════════════════════════
+// RENDER ALL
+// ══════════════════════════════════════════════
+function renderAll() {
+  renderProducts();
+  renderOrderPanel();
+  renderWaiterSelect();
+  renderCustomerSelect();
+  renderWaiters();
+  renderInventory();
+  renderRecaudos();
+  renderGastos();
+  renderOrderHistory();
+  renderStats();
+  renderClientes();
+  renderMisClientes();
+}
+
+// ══════════════════════════════════════════════
+// PRODUCTS
+// ══════════════════════════════════════════════
+function filterCat(cat) {
+  currentCat = cat;
+  document.querySelectorAll('.cat-tab').forEach(t => t.classList.remove('active'));
+  event.target.classList.add('active');
+  renderProducts();
+}
+function renderProducts() {
+  const grid = document.getElementById('productsGrid');
+  const items = currentCat === 'all' ? state.inventory : state.inventory.filter(i => i.cat === currentCat);
+  if (!items.length) { grid.innerHTML = '<div style="color:var(--text-muted);padding:40px;grid-column:1/-1;">No hay productos en esta categoría</div>'; return; }
+
+  grid.innerHTML = '';
+  items.forEach(item => {
+    const card = document.createElement('div');
+    card.className = 'prod-card' + (item.qty <= 0 ? ' out-of-stock' : '');
+    card.dataset.id = item.id;
+    card.draggable = true;
+    card.innerHTML = `
+      <div class="prod-drag-handle" title="Arrastrar para reordenar">⠿</div>
+      <div class="prod-img">
+        ${item.img ? `<img src="${item.img}" alt="${item.name}">` : catEmoji(item.cat)}
+      </div>
+      <div class="prod-info">
+        <div class="prod-name">${item.name}</div>
+        <div class="prod-price">${fmt(item.price)}</div>
+        <div class="prod-stock" ${item.qty <= 5 ? 'style="color:var(--red)"' : ''}>Stock: ${item.qty}</div>
+      </div>`;
+    // Click to add (only if not dragging)
+    card.addEventListener('click', () => { if (!isDraggingCard && item.qty > 0) addToOrder(item.id); });
+    // Drag events
+    card.addEventListener('dragstart', onDragStart);
+    card.addEventListener('dragover',  onDragOver);
+    card.addEventListener('dragleave', onDragLeave);
+    card.addEventListener('drop',      onDrop);
+    card.addEventListener('dragend',   onDragEnd);
+    grid.appendChild(card);
+  });
+}
+
+// ── Drag-and-drop state ──
+let isDraggingCard = false;
+let dragSrcId = null;
+
+function onDragStart(e) {
+  isDraggingCard = true;
+  dragSrcId = parseInt(this.dataset.id);
+  this.classList.add('drag-source');
+  e.dataTransfer.effectAllowed = 'move';
+}
+function onDragOver(e) {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  document.querySelectorAll('.prod-card').forEach(c => c.classList.remove('drag-over'));
+  this.classList.add('drag-over');
+}
+function onDragLeave() {
+  this.classList.remove('drag-over');
+}
+function onDrop(e) {
+  e.stopPropagation();
+  const targetId = parseInt(this.dataset.id);
+  if (dragSrcId === targetId) return;
+
+  // Reorder inside the filtered view, preserving position in full inventory
+  const filterFn = currentCat === 'all' ? () => true : i => i.cat === currentCat;
+  const filtered = state.inventory.filter(filterFn);
+  const others   = state.inventory.filter(i => !filterFn(i));
+
+  const srcIdx = filtered.findIndex(i => i.id === dragSrcId);
+  const tgtIdx = filtered.findIndex(i => i.id === targetId);
+  if (srcIdx < 0 || tgtIdx < 0) return;
+
+  // Splice srcItem before/after target
+  const [srcItem] = filtered.splice(srcIdx, 1);
+  filtered.splice(tgtIdx, 0, srcItem);
+
+  // Rebuild full inventory: interleave filtered back into their original global slots
+  // Strategy: replace items that belong to the filter with the newly ordered list in order
+  let fi = 0;
+  state.inventory = state.inventory.map(i => filterFn(i) ? filtered[fi++] : i);
+
+  saveInventory(); try { localStorage.setItem('posState', JSON.stringify(state)); } catch {}
+  renderProducts();
+}
+function onDragEnd() {
+  isDraggingCard = false;
+  dragSrcId = null;
+  document.querySelectorAll('.prod-card').forEach(c => {
+    c.classList.remove('drag-source', 'drag-over');
+  });
+}
+function catEmoji(cat) {
+  return { cervezas: '🍺', bebidas: '🥤', botellas: '🍾', mecatos: '🍟' }[cat] || '📦';
+}
+
+// ══════════════════════════════════════════════
+// ORDER
+// ══════════════════════════════════════════════
+function addToOrder(id) {
+  const item = state.inventory.find(i => i.id === id);
+  if (!item || item.qty <= 0) return;
+  const ex = currentOrder.items.find(i => i.id === id);
+  if (ex) {
+    if (ex.qty >= item.qty) { notify('Stock insuficiente', 'error'); return; }
+    ex.qty++;
+  } else {
+    currentOrder.items.push({ id, name: item.name, price: item.price, qty: 1 });
+  }
+  renderOrderPanel();
+}
+function removeFromOrder(id) {
+  currentOrder.items = currentOrder.items.filter(i => i.id !== id);
+  renderOrderPanel();
+}
+function changeQty(id, delta) {
+  const item = state.inventory.find(i => i.id === id);
+  const oi = currentOrder.items.find(i => i.id === id);
+  if (!oi) return;
+  oi.qty += delta;
+  if (oi.qty <= 0) { removeFromOrder(id); return; }
+  if (item && oi.qty > item.qty) { oi.qty = item.qty; notify('Stock insuficiente', 'error'); }
+  renderOrderPanel();
+}
+function clearOrder() {
+  currentOrder.items = [];
+  currentOrder.customerId = null;
+  const sel = document.getElementById('orderCustomer');
+  if (sel) sel.value = '';
+  saveState();
+  renderOrderPanel();
+}
+function renderOrderPanel() {
+  const container = document.getElementById('orderItems');
+  if (!currentOrder.items.length) {
+    container.innerHTML = '<div class="order-empty">Agrega productos al pedido</div>';
+    document.getElementById('orderSubtotal').textContent = '$0';
+    document.getElementById('orderTotal').textContent = '$0';
+    return;
+  }
+  let total = 0;
+  container.innerHTML = currentOrder.items.map(oi => {
+    const sub = oi.price * oi.qty; total += sub;
+    return `<div class="order-item">
+      <div class="order-item-name">${oi.name}</div>
+      <div class="order-item-qty">
+        <button class="qty-btn" onclick="changeQty(${oi.id},-1)">−</button>
+        <span class="qty-num">${oi.qty}</span>
+        <button class="qty-btn" onclick="changeQty(${oi.id},1)">+</button>
+      </div>
+      <div class="order-item-subtotal">${fmt(sub)}</div>
+      <button class="order-item-del" onclick="removeFromOrder(${oi.id})">✕</button>
+    </div>`;
+  }).join('');
+  document.getElementById('orderSubtotal').textContent = fmt(total);
+  document.getElementById('orderTotal').textContent = fmt(total);
+}
+function renderWaiterSelect() {
+  const sel = document.getElementById('orderWaiter');
+  const wrapper = document.getElementById('waiterSelectWrapper');
+  if (!sel) return;
+  const cur = sel.value || (currentOrder.waiterId ? String(currentOrder.waiterId) : '');
+  sel.innerHTML = '<option value="">— Seleccionar Mesero —</option>' +
+    state.waiters.map(w => `<option value="${w.id}" ${cur == w.id ? 'selected' : ''}>${w.name}</option>`).join('');
+
+  // If mesero session: lock the select (pre-selected, read-only appearance)
+  if (currentWaiterSession) {
+    sel.value = currentWaiterSession.id;
+    sel.disabled = true;
+    sel.style.opacity = '0.7';
+    sel.style.cursor = 'not-allowed';
+  } else {
+    sel.disabled = false;
+    sel.style.opacity = '';
+    sel.style.cursor = '';
+  }
+}
+
+function renderCustomerSelect() {
+  const sel = document.getElementById('orderCustomer');
+  if (!sel) return;
+  const cur = sel.value || (currentOrder.customerId ? String(currentOrder.customerId) : '');
+  sel.innerHTML = '<option value="">— Seleccionar Cliente * —</option>' +
+    (state.customers || []).map(c => `<option value="${c.id}" ${cur == c.id ? 'selected' : ''}>${c.name}</option>`).join('');
+}
+
+function dispatchOrder() {
+  if (!currentOrder.items.length) { notify('Agrega productos al pedido', 'error'); return; }
+  const waiterId = currentWaiterSession ? currentWaiterSession.id : document.getElementById('orderWaiter').value;
+  if (!waiterId) { notify('Selecciona un mesero', 'error'); return; }
+  const waiter = state.waiters.find(w => w.id == waiterId);
+  const customerId = document.getElementById('orderCustomer').value;
+  if (!customerId) { notify('Selecciona un cliente para el pedido', 'error'); return; }
+  const customer = (state.customers || []).find(c => c.id == customerId);
+  const total = currentOrder.items.reduce((s, i) => s + i.price * i.qty, 0);
+  const orderId = ++state.nextId;
+
+  // Reduce stock
+  currentOrder.items.forEach(oi => {
+    const inv = state.inventory.find(i => i.id === oi.id);
+    if (inv) inv.qty -= oi.qty;
+  });
+
+  const order = {
+    id: orderId,
+    date: new Date().toLocaleString('es-CO'),
+    waiterName: waiter.name,
+    waiterId: waiter.id,
+    customerId: customer ? customer.id : null,
+    customerName: customer ? customer.name : null,
+    clientCode: customer ? (customer.clientCode || null) : null,
+    items: [...currentOrder.items],
+    total,
+  };
+  state.orders.push(order);
+  saveState();
+  saveInventory(); // sync stock reduction in real time
+
+  // ── Firebase Analytics: registrar venta ───────────────────
+  if (window._firebase && window._firebase.ready) {
+    window._firebase.logEvent('order_dispatched', {
+      order_id: orderId,
+      total: total,
+      items_count: order.items.length,
+      waiter: waiter.name
+    });
+  }
+
+  // Imprimir factura
+  printInvoice(order);
+
+  currentOrder.items = [];
+  currentOrder.customerId = null;
+  document.getElementById('orderCustomer').value = '';
+  renderAll();
+  notify(`Pedido #${orderId} despachado ✓`, 'success');
+}
+
+// ══════════════════════════════════════════════
+// PRINT INVOICE
+// ══════════════════════════════════════════════
+function printInvoice(order) {
+  const css = `
+    @import url('https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;700&display=swap');
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Roboto Mono', 'Courier New', monospace;
+      font-size: 15px;
+      color: #000;
+      background: #fff;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }
+    .page {
+      width: 72mm;
+      margin: 0 auto;
+      padding: 8px 6px;
+    }
+    .biz-name {
+      text-align: center;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      margin-bottom: 2px;
+    }
+    .subtitle {
+      text-align: center;
+      font-size: 13px;
+      color: #333;
+      margin-bottom: 8px;
+    }
+    .info-line {
+      font-size: 13px;
+      margin-bottom: 3px;
+    }
+    .divider {
+      border: none;
+      border-top: 2px dashed #000;
+      margin: 8px 0;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    .th-row td {
+      font-size: 13px;
+      font-weight: 700;
+      padding-bottom: 4px;
+      border-bottom: 1px solid #000;
+    }
+    td {
+      font-size: 14px;
+      padding: 3px 0;
+      vertical-align: top;
+    }
+    .right { text-align: right; }
+    .col-prod { width: 55%; }
+    .col-qty  { width: 12%; text-align: center; }
+    .col-val  { width: 33%; text-align: right; }
+    .total-row td {
+      font-size: 17px;
+      font-weight: 700;
+      padding-top: 6px;
+    }
+    .thanks {
+      text-align: center;
+      font-size: 13px;
+      margin-top: 10px;
+      font-weight: 700;
+      letter-spacing: 1px;
+    }
+    .page-break { page-break-after: always; }
+    @media print {
+      body { font-size: 15px; }
+      .page { padding: 4px 4px; }
+    }
+  `;
+
+  const invoiceBlock = (copy) => `
+    <div class="page">
+      <div class="biz-name">TERRAZA LOS CADENAS</div>
+      <div class="subtitle">Sistema POS${copy ? ' &mdash; COPIA' : ''}</div>
+      <hr class="divider">
+      <div class="info-line"><b>Pedido #:</b> ${order.id}</div>
+      <div class="info-line"><b>Fecha:</b> ${order.date}</div>
+      <div class="info-line"><b>Mesero:</b> ${order.waiterName}</div>
+      ${order.customerName ? `<div class="info-line"><b>Cliente:</b> ${order.customerName}</div>` : ''}
+      ${order.clientCode ? `<div class="info-line"><b>Código:</b> <span style="font-weight:700;letter-spacing:2px;">${order.clientCode}</span></div>` : ''}
+      <hr class="divider">
+      <table>
+        <tr class="th-row">
+          <td class="col-prod">Producto</td>
+          <td class="col-qty">Cant</td>
+          <td class="col-val">Total</td>
+        </tr>
+        ${order.items.map(i => `
+        <tr>
+          <td class="col-prod">${i.name}</td>
+          <td class="col-qty">${i.qty}</td>
+          <td class="col-val">${fmt(i.price * i.qty)}</td>
+        </tr>`).join('')}
+      </table>
+      <hr class="divider">
+      <table>
+        <tr class="total-row">
+          <td>TOTAL</td>
+          <td class="right">${fmt(order.total)}</td>
+        </tr>
+      </table>
+      <div class="thanks">¡GRACIAS POR SU VISITA!</div>
+    </div>
+  `;
+
+  const html = `
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+      <meta charset="UTF-8">
+      <title>Pedido #${order.id}</title>
+      <style>${css}</style>
+    </head>
+    <body>
+      ${invoiceBlock(false)}
+      <div class="page-break"></div>
+      ${invoiceBlock(true)}
+    </body>
+    </html>
+  `;
+  openPrint(html);
+}
+
+function printRecaudoInvoice(rec) {
+  const css = `
+    @import url('https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;700&display=swap');
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Roboto Mono', 'Courier New', monospace;
+      font-size: 15px;
+      color: #000;
+      background: #fff;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }
+    .page {
+      width: 72mm;
+      margin: 0 auto;
+      padding: 8px 6px;
+    }
+    .biz-name {
+      text-align: center;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      margin-bottom: 2px;
+    }
+    .subtitle {
+      text-align: center;
+      font-size: 13px;
+      color: #333;
+      margin-bottom: 8px;
+    }
+    .divider {
+      border: none;
+      border-top: 2px dashed #000;
+      margin: 8px 0;
+    }
+    .info-line {
+      font-size: 14px;
+      margin-bottom: 4px;
+    }
+    .monto-box {
+      text-align: center;
+      font-size: 22px;
+      font-weight: 700;
+      margin: 10px 0;
+      padding: 6px 0;
+      border-top: 2px solid #000;
+      border-bottom: 2px solid #000;
+      letter-spacing: 1px;
+    }
+    .footer {
+      text-align: center;
+      font-size: 13px;
+      font-weight: 700;
+      margin-top: 10px;
+      letter-spacing: 1px;
+    }
+    .page-break { page-break-after: always; }
+    @media print {
+      body { font-size: 15px; }
+    }
+  `;
+
+  const recBlock = (copy) => `
+    <div class="page">
+      <div class="biz-name">TERRAZA LOS CADENAS</div>
+      <div class="subtitle">RECIBO DE PAGO${copy ? ' &mdash; COPIA' : ''}</div>
+      <hr class="divider">
+      <div class="info-line"><b>Recaudo #:</b> ${rec.id}</div>
+      <div class="info-line"><b>Fecha:</b> ${rec.date}</div>
+      <div class="info-line"><b>Mesero:</b> ${rec.waiterName}</div>
+      <div class="info-line"><b>Tipo de pago:</b> ${rec.tipo === 'efectivo' ? 'Efectivo' : 'Transferencia'}</div>
+      <hr class="divider">
+      <div class="monto-box">MONTO: ${fmt(rec.monto)}</div>
+      <div class="footer">RECIBO DE PAGO</div>
+    </div>
+  `;
+
+  const html = `
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+      <meta charset="UTF-8">
+      <title>Recaudo #${rec.id}</title>
+      <style>${css}</style>
+    </head>
+    <body>
+      ${recBlock(false)}
+      <div class="page-break"></div>
+      ${recBlock(true)}
+    </body>
+    </html>
+  `;
+  openPrint(html);
+}
+
+function openPrint(html) {
+  const w = window.open('', '_blank', 'width=420,height=680');
+  w.document.write(html);
+  w.document.close();
+  w.focus();
+  setTimeout(() => { w.print(); }, 600);
+}
+
+// ══════════════════════════════════════════════
+// WAITERS
+// ══════════════════════════════════════════════
+function addWaiter() {
+  const name = document.getElementById('newWaiterName').value.trim();
+  const username = document.getElementById('newWaiterUser').value.trim().toLowerCase();
+  const password = document.getElementById('newWaiterPw').value;
+  if (!name) { notify('Ingresa el nombre del mesero', 'error'); return; }
+  if (!username) { notify('Ingresa un usuario para el mesero', 'error'); return; }
+  if (!password) { notify('Ingresa una contraseña para el mesero', 'error'); return; }
+  // Verificar que el usuario no esté repetido
+  if (state.waiters.find(w => (w.username || '').toLowerCase() === username)) {
+    notify('Ese usuario ya está en uso, elige otro', 'error'); return;
+  }
+  state.waiters.push({ id: ++state.nextId, name, username, password });
+  document.getElementById('newWaiterName').value = '';
+  document.getElementById('newWaiterUser').value = '';
+  document.getElementById('newWaiterPw').value = '';
+  saveState(); renderAll();
+  notify('Mesero agregado ✓', 'success');
+}
+function deleteWaiter(id) {
+  if (!confirm('¿Eliminar este mesero?')) return;
+  state.waiters = state.waiters.filter(w => w.id !== id);
+  saveState(); renderAll();
+}
+function renderWaiters() {
+  const tb = document.getElementById('waitersTbody');
+  if (!tb) return;
+  tb.innerHTML = state.waiters.map((w, i) => {
+    const orders = state.orders.filter(o => o.waiterId === w.id).length;
+    return `<tr>
+      <td>${i + 1}</td>
+      <td>${w.name}</td>
+      <td><span class="badge badge-blue">${w.username || '<em style="color:var(--text-muted)">—</em>'}</span></td>
+      <td><span class="badge badge-gold">${orders}</span></td>
+      <td><button class="btn btn-danger" onclick="deleteWaiter(${w.id})">Eliminar</button></td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="5" style="text-align:center;color:var(--text-muted)">Sin meseros</td></tr>';
+  // also update recaudo select
+  const rs = document.getElementById('recMesero');
+  if (rs) {
+    rs.innerHTML = '<option value="">— Seleccionar —</option>' +
+      state.waiters.map(w => `<option value="${w.id}">${w.name}</option>`).join('');
+  }
+  renderWaiterAccounts();
+}
+
+function renderWaiterAccounts() {
+  const tb = document.getElementById('waiterAccountTbody');
+  if (!tb) return;
+  let totVentas = 0, totRecaudado = 0;
+  if (!state.waiters.length) {
+    tb.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-muted)">Sin meseros</td></tr>';
+    ['waiterStatVentas','waiterStatRecaudado','waiterStatPendiente'].forEach(id => {
+      const el = document.getElementById(id); if (el) el.textContent = '$0';
+    });
+    return;
+  }
+  tb.innerHTML = state.waiters.map(w => {
+    const wOrders = state.orders.filter(o => o.waiterId === w.id);
+    const ventas = wOrders.reduce((s, o) => s + o.total, 0);
+    const recaudado = state.recaudos.filter(r => r.waiterId === w.id).reduce((s, r) => s + r.monto, 0);
+    const pendiente = Math.max(0, ventas - recaudado);
+    totVentas += ventas; totRecaudado += recaudado;
+    const pendClass = pendiente > 0 ? 'color:var(--red)' : 'color:var(--green)';
+    return `<tr>
+      <td><strong>${w.name}</strong></td>
+      <td><span class="badge badge-gold">${wOrders.length}</span></td>
+      <td style="color:var(--gold);font-weight:700;">${fmt(ventas)}</td>
+      <td style="color:var(--green);font-weight:600;">${fmt(recaudado)}</td>
+      <td style="${pendClass};font-weight:700;">${pendiente > 0 ? fmt(pendiente) : '✔ Al día'}</td>
+    </tr>`;
+  }).join('');
+  const totPendiente = Math.max(0, totVentas - totRecaudado);
+  const sv = document.getElementById('waiterStatVentas');
+  const sr = document.getElementById('waiterStatRecaudado');
+  const sp = document.getElementById('waiterStatPendiente');
+  if (sv) sv.textContent = fmt(totVentas);
+  if (sr) sr.textContent = fmt(totRecaudado);
+  if (sp) sp.textContent = totPendiente > 0 ? fmt(totPendiente) : '$0';
+}
+
+// ══════════════════════════════════════════════
+// CUSTOMERS (CLIENTES)
+// ══════════════════════════════════════════════
+
+function openNewCustomerModal() {
+  document.getElementById('newClientName').value = '';
+  document.getElementById('newClientContact').value = '';
+  document.getElementById('newCustomerModal').classList.remove('hidden');
+  setTimeout(() => document.getElementById('newClientName').focus(), 100);
+}
+
+function generateClientCode() {
+  // Generate unique 4-char alphanumeric code (letters + numbers, no ambiguous chars)
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code, attempts = 0;
+  do {
+    code = '';
+    for (let i = 0; i < 4; i++) code += chars[Math.floor(Math.random() * chars.length)];
+    attempts++;
+  } while (attempts < 100 && (state.customers || []).some(c => c.clientCode === code));
+  return code;
+}
+
+function saveNewCustomer() {
+  const name = document.getElementById('newClientName').value.trim();
+  if (!name) { notify('Ingresa el nombre del cliente', 'error'); return; }
+  const contact = document.getElementById('newClientContact').value.trim();
+  const clientCode = generateClientCode();
+  const customer = {
+    id: ++state.nextId,
+    name,
+    contact,
+    clientCode,
+    createdAt: new Date().toLocaleString('es-CO'),
+  };
+  if (!state.customers) state.customers = [];
+  state.customers.push(customer);
+  saveState();
+  renderAll();
+  closeModal('newCustomerModal');
+  notify('Cliente creado — Código: ' + clientCode + ' ✓', 'success');
+}
+
+function deleteCustomer(id) {
+  if (!confirm('¿Eliminar este cliente? Sus pedidos no se eliminarán.')) return;
+  state.customers = (state.customers || []).filter(c => c.id !== id);
+  saveState(); renderAll();
+}
+
+function renderClientes() {
+  const tb = document.getElementById('clientesTbody');
+  if (!tb) return;
+  const q = (document.getElementById('clientSearch')?.value || '').toLowerCase();
+  // Admin sees all; mesero sees only their clients
+  let customers = (state.customers || []).filter(c => !q || c.name.toLowerCase().includes(q) || (c.contact||'').toLowerCase().includes(q) || (c.clientCode||'').toLowerCase().includes(q));
+  if (currentWaiterSession) {
+    // Filter customers that have at least one order from this waiter
+    const myCustomerIds = new Set(state.orders.filter(o => o.waiterId === currentWaiterSession.id && o.customerId).map(o => o.customerId));
+    customers = customers.filter(c => myCustomerIds.has(c.id));
+  }
+
+  if (!customers.length) {
+    tb.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--text-muted)">Sin clientes registrados</td></tr>';
+    return;
+  }
+
+  tb.innerHTML = customers.map((c, i) => {
+    const cOrders = (state.orders || []).filter(o => o.customerId === c.id);
+    const totalVentas = cOrders.reduce((s, o) => s + o.total, 0);
+    const recaudado = (state.recaudos || []).filter(r => r.customerId === c.id).reduce((s, r) => s + r.monto, 0);
+    const pendiente = Math.max(0, totalVentas - recaudado);
+    const pendClass = pendiente > 0 ? 'color:var(--red)' : 'color:var(--green)';
+    return `<tr>
+      <td>${i + 1}</td>
+      <td><strong>${c.name}</strong></td>
+      <td style="color:var(--text-muted);font-size:.8rem;">${c.contact || '—'}</td>
+      <td><span class="badge badge-blue" style="font-family:'Roboto Mono',monospace;letter-spacing:2px;">${c.clientCode || '—'}</span></td>
+      <td><span class="badge badge-gold">${cOrders.length}</span></td>
+      <td style="color:var(--gold);font-weight:700;">${fmt(totalVentas)}</td>
+      <td style="color:var(--green);font-weight:600;">${fmt(recaudado)}</td>
+      <td style="${pendClass};font-weight:700;">${pendiente > 0 ? fmt(pendiente) : '✔ Al día'}</td>
+      <td style="display:flex;gap:6px;flex-wrap:wrap;">
+        <button class="btn btn-info" style="font-size:.75rem;padding:5px 8px;" onclick="showClientAccount(${c.id})">📊 Ver</button>
+        <button class="btn btn-danger" style="font-size:.75rem;padding:5px 8px;" onclick="deleteCustomer(${c.id})">🗑️</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Client Account Functions ──────────────────
+function getClientAccountData(clientId) {
+  const c = (state.customers || []).find(x => x.id === clientId);
+  if (!c) return null;
+  const cOrders = (state.orders || []).filter(o => o.customerId === c.id);
+  const totalVentas = cOrders.reduce((s, o) => s + o.total, 0);
+  const recaudado = (state.recaudos || []).filter(r => r.customerId === c.id).reduce((s, r) => s + r.monto, 0);
+  const pendiente = Math.max(0, totalVentas - recaudado);
+  return { c, cOrders, totalVentas, recaudado, pendiente };
+}
+
+function buildAccountSummaryGrid(totalVentas, recaudado, pendiente, cOrders) {
+  const p = pendiente > 0;
+  return `
+    <div style="background:var(--dark3);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center;">
+      <div style="font-size:.72rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">Pedidos</div>
+      <div style="font-size:1.1rem;font-weight:700;color:var(--gold);">${cOrders.length}</div>
+    </div>
+    <div style="background:var(--dark3);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center;">
+      <div style="font-size:.72rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">Total consumo</div>
+      <div style="font-size:1.1rem;font-weight:700;color:var(--gold);">${fmt(totalVentas)}</div>
+    </div>
+    <div style="background:var(--dark3);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center;">
+      <div style="font-size:.72rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">Pagado</div>
+      <div style="font-size:1.1rem;font-weight:700;color:var(--green);">${fmt(recaudado)}</div>
+    </div>
+    <div style="background:var(--dark3);border:1px solid ${p?'rgba(192,57,43,.4)':'rgba(39,174,96,.3)'};border-radius:8px;padding:12px;text-align:center;${p?'background:rgba(192,57,43,.08);':''}">
+      <div style="font-size:.72rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">Pendiente</div>
+      <div style="font-size:1.1rem;font-weight:700;color:${p?'var(--red)':'var(--green)'};">${p?fmt(pendiente):'✔ Al día'}</div>
+    </div>`;
+}
+
+function buildOrdersList(cOrders) {
+  if (!cOrders.length) return '<div style="text-align:center;color:var(--text-muted);padding:18px;font-size:.88rem;">Sin pedidos registrados</div>';
+  return [...cOrders].reverse().map(o => {
+    const waiter = state.waiters.find(w => w.id === o.waiterId);
+    return `
+    <div style="background:var(--dark3);border:1px solid var(--border);border-radius:8px;padding:10px 12px;">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;">
+        <span style="background:rgba(212,168,67,.15);color:var(--gold);font-size:.75rem;font-weight:700;padding:2px 7px;border-radius:4px;font-family:'Roboto Mono',monospace;">#${o.id}</span>
+        <span style="font-size:.72rem;color:var(--text-muted);flex:1;">${o.date}</span>
+        ${waiter ? `<span style="font-size:.72rem;color:var(--text-muted);">👤 ${waiter.name}</span>` : ''}
+        <span style="font-size:.9rem;font-weight:700;color:var(--gold);">${fmt(o.total)}</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:4px;">${o.items.map(it => `<span style="background:rgba(255,255,255,.05);border-radius:4px;font-size:.72rem;padding:2px 6px;color:#aaa;">${it.name} ×${it.qty}</span>`).join('')}</div>
+    </div>`;
+  }).join('');
+}
+
+function buildRecaudosList(clientId) {
+  const recaudos = (state.recaudos || []).filter(r => r.customerId === clientId);
+  if (!recaudos.length) return '<div style="text-align:center;color:var(--text-muted);padding:12px;font-size:.85rem;">Sin pagos registrados</div>';
+  return [...recaudos].reverse().map(r => {
+    const waiter = state.waiters.find(w => w.id === r.waiterId);
+    return `
+    <div style="background:rgba(39,174,96,.07);border:1px solid rgba(39,174,96,.25);border-radius:6px;padding:8px 12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+      <span style="color:var(--green);font-weight:700;font-size:.95rem;">${fmt(r.monto)}</span>
+      <span style="font-size:.72rem;color:var(--text-muted);flex:1;">${r.fecha || r.date || ''}</span>
+      ${waiter ? `<span style="font-size:.72rem;color:var(--text-muted);">👤 ${waiter.name}</span>` : ''}
+      ${r.nota ? `<span style="font-size:.72rem;color:var(--text-muted);width:100%;padding-top:2px;">📝 ${r.nota}</span>` : ''}
+    </div>`;
+  }).join('');
+}
+
+function showClientAccount(clientId) {
+  const data = getClientAccountData(clientId);
+  if (!data) return;
+  const { c, cOrders, totalVentas, recaudado, pendiente } = data;
+  document.getElementById('camClientName').textContent = '📊 ' + c.name;
+  document.getElementById('camClientInfo').textContent = (c.contact ? c.contact + '  ·  ' : '') + 'Código: ' + (c.clientCode || '—');
+  document.getElementById('camSummaryGrid').innerHTML = buildAccountSummaryGrid(totalVentas, recaudado, pendiente, cOrders);
+  document.getElementById('camPendBanner').innerHTML = pendiente > 0
+    ? `<div style="background:rgba(192,57,43,.12);border:1px solid rgba(192,57,43,.4);border-radius:8px;padding:10px 14px;font-size:.88rem;color:var(--red);text-align:center;">⚠️ Saldo pendiente: <strong>${fmt(pendiente)}</strong></div>`
+    : `<div style="background:rgba(39,174,96,.1);border:1px solid rgba(39,174,96,.3);border-radius:8px;padding:10px 14px;font-size:.88rem;color:var(--green);text-align:center;">✅ ¡Al día! Sin saldos pendientes.</div>`;
+  document.getElementById('camOrdersList').innerHTML = buildOrdersList(cOrders);
+  document.getElementById('camRecaudosList').innerHTML = buildRecaudosList(clientId);
+  document.getElementById('clientAccountModal').classList.remove('hidden');
+}
+
+// ── Portal Cliente (pantalla full) ────────────
+function openClientPortal(code) {
+  const posState = (() => { try { return JSON.parse(localStorage.getItem('posState')); } catch { return null; } })();
+  const customers = posState ? posState.customers || [] : state.customers || [];
+  const orders = posState ? posState.orders || [] : state.orders || [];
+  const recaudos = posState ? posState.recaudos || [] : state.recaudos || [];
+  const c = customers.find(x => (x.clientCode || '').toUpperCase() === code.toUpperCase());
+  if (!c) return false;
+  const cOrders = orders.filter(o => o.customerId === c.id);
+  const totalVentas = cOrders.reduce((s, o) => s + o.total, 0);
+  const recaudado = recaudos.filter(r => r.customerId === c.id).reduce((s, r) => s + r.monto, 0);
+  const pendiente = Math.max(0, totalVentas - recaudado);
+
+  document.getElementById('cpAvatar').textContent = c.name.charAt(0).toUpperCase();
+  document.getElementById('cpName').textContent = c.name;
+  document.getElementById('cpContact').textContent = c.contact || '';
+  document.getElementById('cpCode').textContent = 'Código: ' + c.clientCode;
+  document.getElementById('cpSummaryGrid').innerHTML = buildAccountSummaryGrid(totalVentas, recaudado, pendiente, cOrders);
+  document.getElementById('cpBanner').innerHTML = pendiente > 0
+    ? `<div style="background:rgba(192,57,43,.12);border:1px solid rgba(192,57,43,.4);border-radius:8px;padding:12px 16px;font-size:.9rem;color:var(--red);text-align:center;">⚠️ Tienes un saldo pendiente de <strong>${fmt(pendiente)}</strong></div>`
+    : `<div style="background:rgba(39,174,96,.1);border:1px solid rgba(39,174,96,.3);border-radius:8px;padding:12px 16px;font-size:.9rem;color:var(--green);text-align:center;">✅ ¡Estás al día! Sin saldos pendientes.</div>`;
+  document.getElementById('cpOrdersList').innerHTML = buildOrdersList(cOrders);
+
+  document.getElementById('clientPortalScreen').style.display = 'block';
+  return true;
+}
+
+function closeClientPortal() {
+  document.getElementById('clientPortalScreen').style.display = 'none';
+  // Go back to lock/relock screen
+  document.getElementById('lockScreen').style.display = 'flex';
+  document.getElementById('lockStep1').style.display = 'flex';
+  document.getElementById('lockStep2Cliente').style.display = 'none';
+  document.getElementById('lockStep2Admin').style.display = 'none';
+  document.getElementById('lockStep2Mesero').style.display = 'none';
+}
+
+function verClientePortal() {
+  const code = (document.getElementById('lockClientCode')?.value || '').trim().toUpperCase();
+  const err = document.getElementById('lockClientErrMsg');
+  if (!code || code.length !== 4) { err.textContent = 'Ingresa un código de 4 caracteres'; return; }
+  const found = openClientPortal(code);
+  if (!found) {
+    err.textContent = 'Código no encontrado. Verifica e intenta de nuevo.';
+  } else {
+    err.textContent = '';
+    document.getElementById('lockScreen').style.display = 'none';
+  }
+}
+
+function relockVerCliente() {
+  const code = (document.getElementById('relockClientCode')?.value || '').trim().toUpperCase();
+  const err = document.getElementById('relockClientErrMsg');
+  if (!code || code.length !== 4) { err.textContent = 'Ingresa un código de 4 caracteres'; return; }
+  const found = openClientPortal(code);
+  if (!found) {
+    err.textContent = 'Código no encontrado. Verifica e intenta de nuevo.';
+  } else {
+    err.textContent = '';
+    document.getElementById('relockScreen').style.display = 'none';
+  }
+}
+
+
+function previewInvImg(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    invImgData = e.target.result;
+    const prev = document.getElementById('invImgPreview');
+    prev.innerHTML = `<img src="${invImgData}">`;
+  };
+  reader.readAsDataURL(file);
+}
+function previewEditImg(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    editImgData = e.target.result;
+    const prev = document.getElementById('editImgPreview');
+    prev.innerHTML = `<img src="${editImgData}">`;
+  };
+  reader.readAsDataURL(file);
+}
+function addInventoryItem() {
+  const name = document.getElementById('invName').value.trim();
+  const cat = document.getElementById('invCat').value;
+  const price = parseFloat(document.getElementById('invPrice').value);
+  const qty = parseInt(document.getElementById('invQty').value);
+  if (!name || isNaN(price) || isNaN(qty)) { notify('Completa todos los campos', 'error'); return; }
+  state.inventory.push({ id: ++state.nextId, name, cat, price, qty, img: invImgData || null });
+  document.getElementById('invName').value = '';
+  document.getElementById('invPrice').value = '';
+  document.getElementById('invQty').value = '';
+  document.getElementById('invImg').value = '';
+  document.getElementById('invImgPreview').innerHTML = '📷';
+  invImgData = null;
+  saveState(); renderAll();
+  notify('Artículo agregado ✓', 'success');
+}
+function deleteInventoryItem(id) {
+  if (!confirm('¿Eliminar este artículo?')) return;
+  state.inventory = state.inventory.filter(i => i.id !== id);
+  saveState(); renderAll();
+}
+function editInventoryItem(id) {
+  const item = state.inventory.find(i => i.id === id);
+  if (!item) return;
+  document.getElementById('editId').value = id;
+  document.getElementById('editName').value = item.name;
+  document.getElementById('editCat').value = item.cat;
+  document.getElementById('editPrice').value = item.price;
+  document.getElementById('editQty').value = item.qty;
+  editImgData = item.img;
+  document.getElementById('editImgPreview').innerHTML = item.img ? `<img src="${item.img}">` : '📷';
+  document.getElementById('editModal').classList.remove('hidden');
+}
+function saveEdit() {
+  const id = parseInt(document.getElementById('editId').value);
+  const item = state.inventory.find(i => i.id === id);
+  if (!item) return;
+  item.name = document.getElementById('editName').value.trim();
+  item.cat = document.getElementById('editCat').value;
+  item.price = parseFloat(document.getElementById('editPrice').value);
+  item.qty = parseInt(document.getElementById('editQty').value);
+  if (editImgData) item.img = editImgData;
+  closeModal('editModal');
+  saveState(); renderAll();
+  notify('Artículo actualizado ✓', 'success');
+}
+function renderInventory() {
+  const tb = document.getElementById('inventoryTbody');
+  if (!tb) return;
+  const search = (document.getElementById('invSearch')?.value || '').toLowerCase();
+  const items = state.inventory.filter(i => i.name.toLowerCase().includes(search));
+  tb.innerHTML = items.map(item => `
+    <tr>
+      <td>
+        <div class="prod-thumb">${item.img ? `<img src="${item.img}">` : catEmoji(item.cat)}</div>
+      </td>
+      <td>${item.name}</td>
+      <td><span class="badge badge-blue">${catLabel(item.cat)}</span></td>
+      <td>${fmt(item.price)}</td>
+      <td><span class="badge ${item.qty <= 0 ? 'badge-red' : item.qty <= 5 ? 'badge-gold' : 'badge-green'}">${item.qty}</span></td>
+      <td style="display:flex;gap:6px;">
+        <button class="btn btn-secondary" onclick="editInventoryItem(${item.id})">✏️</button>
+        <button class="btn btn-danger" onclick="deleteInventoryItem(${item.id})">🗑️</button>
+      </td>
+    </tr>
+  `).join('') || '<tr><td colspan="6" style="text-align:center;color:var(--text-muted)">Sin artículos</td></tr>';
+}
+function catLabel(cat) {
+  return { cervezas: '🍺 Cervezas', bebidas: '🥤 Bebidas', botellas: '🍾 Botellas', mecatos: '🍟 Mecatos' }[cat] || cat;
+}
+
+// Excel load (CSV support)
+function loadExcel() {
+  const file = document.getElementById('excelFile').files[0];
+  if (!file) { notify('Selecciona un archivo', 'error'); return; }
+  const reader = new FileReader();
+  reader.onload = e => {
+    const text = e.target.result;
+    const lines = text.split('\n').filter(l => l.trim());
+    let added = 0;
+    for (let i = 1; i < lines.length; i++) {
+      const cols = lines[i].split(',').map(c => c.trim().replace(/"/g, ''));
+      if (cols.length < 4) continue;
+      const [name, cat, price, qty] = cols;
+      if (!name) continue;
+      const validCat = ['cervezas','bebidas','botellas','mecatos'].includes(cat.toLowerCase()) ? cat.toLowerCase() : 'bebidas';
+      state.inventory.push({ id: ++state.nextId, name, cat: validCat, price: parseFloat(price)||0, qty: parseInt(qty)||0, img: null });
+      added++;
+    }
+    saveState(); renderAll();
+    notify(`${added} artículos importados ✓`, 'success');
+  };
+  reader.readAsText(file);
+}
+
+// ══════════════════════════════════════════════
+// RECAUDOS
+// ══════════════════════════════════════════════
+function addRecaudo() {
+  const waiterId = document.getElementById('recMesero').value;
+  const tipo = document.getElementById('recTipo').value;
+  const monto = parseFloat(document.getElementById('recMonto').value);
+  if (!waiterId || isNaN(monto) || monto <= 0) { notify('Completa todos los campos', 'error'); return; }
+  const waiter = state.waiters.find(w => w.id == waiterId);
+  const rec = { id: ++state.nextId, date: new Date().toLocaleString('es-CO'), waiterId: waiter.id, waiterName: waiter.name, tipo, monto };
+  state.recaudos.push(rec);
+  document.getElementById('recMonto').value = '';
+  saveState(); renderAll();
+  printRecaudoInvoice(rec);
+  notify('Recaudo registrado ✓', 'success');
+}
+function renderRecaudos() {
+  const tb = document.getElementById('recaudosTbody');
+  if (!tb) return;
+  let efe = 0, tra = 0;
+  tb.innerHTML = state.recaudos.map(r => {
+    if (r.tipo === 'efectivo') efe += r.monto; else tra += r.monto;
+    return `<tr>
+      <td>${r.date}</td>
+      <td>${r.waiterName}</td>
+      <td><span class="badge ${r.tipo === 'efectivo' ? 'badge-green' : 'badge-blue'}">${r.tipo}</span></td>
+      <td>${fmt(r.monto)}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="4" style="text-align:center;color:var(--text-muted)">Sin recaudos</td></tr>';
+  const te = document.getElementById('totalEfectivo');
+  const tt = document.getElementById('totalTransferencia');
+  if (te) te.textContent = fmt(efe);
+  if (tt) tt.textContent = fmt(tra);
+}
+
+// ══════════════════════════════════════════════
+// GASTOS
+// ══════════════════════════════════════════════
+function addGasto() {
+  const desc = document.getElementById('gastoDesc').value.trim();
+  const valor = parseFloat(document.getElementById('gastoValor').value);
+  if (!desc || isNaN(valor)) { notify('Completa los campos', 'error'); return; }
+  state.gastos.push({ id: ++state.nextId, date: new Date().toLocaleString('es-CO'), desc, valor });
+  document.getElementById('gastoDesc').value = '';
+  document.getElementById('gastoValor').value = '';
+  saveState(); renderAll();
+  notify('Gasto registrado ✓', 'success');
+}
+function deleteGasto(id) {
+  state.gastos = state.gastos.filter(g => g.id !== id);
+  saveState(); renderAll();
+}
+function renderGastos() {
+  const tb = document.getElementById('gastosTbody');
+  if (!tb) return;
+  let total = 0;
+  tb.innerHTML = state.gastos.map(g => {
+    total += g.valor;
+    return `<tr>
+      <td>${g.date}</td>
+      <td>${g.desc}</td>
+      <td>${fmt(g.valor)}</td>
+      <td><button class="btn btn-danger" onclick="deleteGasto(${g.id})">🗑️</button></td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="4" style="text-align:center;color:var(--text-muted)">Sin gastos</td></tr>';
+  const tg = document.getElementById('totalGastos');
+  if (tg) tg.textContent = fmt(total);
+}
+
+// ══════════════════════════════════════════════
+// ORDER HISTORY
+// ══════════════════════════════════════════════
+function deleteOrder(id) {
+  if (!confirm('¿Eliminar este pedido?')) return;
+  state.orders = state.orders.filter(o => o.id !== id);
+  saveState(); renderAll();
+}
+function renderOrderHistory() {
+  const tb = document.getElementById('orderHistoryTbody');
+  if (!tb) return;
+  tb.innerHTML = [...state.orders].reverse().map(o => `
+    <tr>
+      <td>#${o.id}</td>
+      <td>${o.date}</td>
+      <td>${o.waiterName}</td>
+      <td>${o.items.map(i => `${i.name}×${i.qty}`).join(', ')}</td>
+      <td><strong style="color:var(--gold)">${fmt(o.total)}</strong></td>
+      <td><button class="btn btn-danger" onclick="deleteOrder(${o.id})">🗑️</button></td>
+    </tr>
+  `).join('') || '<tr><td colspan="6" style="text-align:center;color:var(--text-muted)">Sin pedidos</td></tr>';
+}
+
+// ══════════════════════════════════════════════
+// STATS
+// ══════════════════════════════════════════════
+function renderStats() {
+  const totalVentas = state.orders.reduce((s, o) => s + o.total, 0);
+  const totalRecaudado = state.recaudos.reduce((s, r) => s + r.monto, 0);
+  const totalGastos = state.gastos.reduce((s, g) => s + g.valor, 0);
+  const sv = document.getElementById('statVentas');
+  const sp = document.getElementById('statPedidos');
+  const sr = document.getElementById('statRecaudado');
+  const sg = document.getElementById('statGastos');
+  if (sv) sv.textContent = fmt(totalVentas);
+  if (sp) sp.textContent = state.orders.length;
+  if (sr) sr.textContent = fmt(totalRecaudado);
+  if (sg) sg.textContent = fmt(totalGastos);
+}
+
+// ══════════════════════════════════════════════
+// CIERRE DE TURNO — TEXTO PLANO
+// ══════════════════════════════════════════════
+function printCierre() {
+  const now = new Date().toLocaleString('es-CO');
+  const totalVentas     = state.orders.reduce((s, o) => s + o.total, 0);
+  const efe             = state.recaudos.filter(r => r.tipo === 'efectivo').reduce((s, r) => s + r.monto, 0);
+  const tra             = state.recaudos.filter(r => r.tipo === 'transferencia').reduce((s, r) => s + r.monto, 0);
+  const totalRecaudado  = efe + tra;
+  const totalGastos     = state.gastos.reduce((s, g) => s + g.valor, 0);
+  const neto            = totalRecaudado - totalGastos;
+
+  // ── CSS compartido (igual al de pedidos/recaudos) ──
+  const css = `
+    @import url('https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;700&display=swap');
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Roboto Mono', 'Courier New', monospace;
+      font-size: 14px;
+      color: #000;
+      background: #fff;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }
+    .page {
+      width: 76mm;
+      margin: 0 auto;
+      padding: 10px 6px 16px;
+    }
+    .biz-name {
+      text-align: center;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      margin-bottom: 2px;
+    }
+    .subtitle {
+      text-align: center;
+      font-size: 13px;
+      color: #333;
+      margin-bottom: 4px;
+      letter-spacing: 1px;
+    }
+    .date-line {
+      text-align: center;
+      font-size: 12px;
+      color: #444;
+      margin-bottom: 8px;
+    }
+    .divider-solid {
+      border: none;
+      border-top: 2px solid #000;
+      margin: 7px 0;
+    }
+    .divider-dash {
+      border: none;
+      border-top: 2px dashed #000;
+      margin: 7px 0;
+    }
+    .section-title {
+      font-size: 13px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin: 8px 0 4px;
+    }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 14px;
+      padding: 2px 0;
+    }
+    .row.bold { font-weight: 700; }
+    .row.large {
+      font-size: 16px;
+      font-weight: 700;
+      padding: 4px 0;
+    }
+    .row.highlight {
+      font-size: 17px;
+      font-weight: 700;
+      border-top: 2px solid #000;
+      border-bottom: 2px solid #000;
+      padding: 5px 0;
+      margin: 4px 0;
+    }
+    .waiter-block {
+      margin-bottom: 6px;
+    }
+    .waiter-name {
+      font-size: 14px;
+      font-weight: 700;
+      margin-bottom: 2px;
+    }
+    .waiter-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 13px;
+      padding: 1px 0 1px 10px;
+    }
+    .inv-cat {
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      margin: 6px 0 2px;
+      letter-spacing: 1px;
+    }
+    .inv-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 13px;
+      padding: 1px 0 1px 6px;
+    }
+    .inv-row .stock { color: #333; font-size: 12px; }
+    .gasto-row {
+      font-size: 13px;
+      padding: 2px 0;
+    }
+    .gasto-row .gasto-desc { font-size: 12px; color: #444; padding-left: 6px; }
+    .footer {
+      text-align: center;
+      font-size: 13px;
+      font-weight: 700;
+      margin-top: 10px;
+      letter-spacing: 2px;
+    }
+    @media print {
+      body { font-size: 14px; }
+      .page { padding: 4px 4px 12px; }
+    }
+  `;
+
+  // ── Sección meseros ──
+  let waitersHtml = '';
+  if (!state.waiters.length) {
+    waitersHtml = '<div style="font-size:13px;color:#555;">Sin meseros registrados.</div>';
+  } else {
+    state.waiters.forEach(w => {
+      const wOrders   = state.orders.filter(o => o.waiterId === w.id);
+      const ventas    = wOrders.reduce((s, o) => s + o.total, 0);
+      const recaudado = state.recaudos.filter(r => r.waiterId === w.id).reduce((s, r) => s + r.monto, 0);
+      const pendiente = Math.max(0, ventas - recaudado);
+      waitersHtml += `
+        <div class="waiter-block">
+          <div class="waiter-name">${w.name}</div>
+          <div class="waiter-row"><span>Pedidos</span><span>${wOrders.length}</span></div>
+          <div class="waiter-row"><span>Ventas</span><span>${fmt(ventas)}</span></div>
+          <div class="waiter-row"><span>Recaudado</span><span>${fmt(recaudado)}</span></div>
+          <div class="waiter-row"><span>Pendiente</span><span>${pendiente > 0 ? fmt(pendiente) : 'Al día'}</span></div>
+        </div>
+        <hr class="divider-dash">`;
+    });
+  }
+
+  // ── Sección inventario ──
+  const cats = ['cervezas','bebidas','botellas','mecatos'];
+  let invHtml = '';
+  cats.forEach(cat => {
+    const items = state.inventory.filter(i => i.cat === cat);
+    if (!items.length) return;
+    invHtml += `<div class="inv-cat">${catLabel(cat)}</div>`;
+    items.forEach(i => {
+      invHtml += `
+        <div class="inv-row">
+          <span>${i.name}</span>
+          <span class="stock">Stock: ${i.qty} &nbsp; ${fmt(i.price)}</span>
+        </div>`;
+    });
+  });
+
+  // ── Sección gastos ──
+  let gastosHtml = '';
+  if (!state.gastos.length) {
+    gastosHtml = '<div style="font-size:13px;color:#555;">Sin gastos registrados.</div>';
+  } else {
+    state.gastos.forEach(g => {
+      gastosHtml += `
+        <div class="gasto-row">
+          <div style="display:flex;justify-content:space-between;">
+            <span>${g.desc}</span><span>${fmt(g.valor)}</span>
+          </div>
+          <div class="gasto-desc">${g.date}</div>
+        </div>`;
+    });
+    gastosHtml += `
+      <hr class="divider-dash">
+      <div class="row bold"><span>TOTAL GASTOS</span><span>${fmt(totalGastos)}</span></div>`;
+  }
+
+  const html = `
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+      <meta charset="UTF-8">
+      <title>Cierre de Turno</title>
+      <style>${css}</style>
+    </head>
+    <body>
+      <div class="page">
+
+        <!-- ENCABEZADO -->
+        <div class="biz-name">TERRAZA LOS CADENAS</div>
+        <div class="subtitle">⎯⎯ CIERRE DE TURNO ⎯⎯</div>
+        <div class="date-line">${now}</div>
+        <hr class="divider-solid">
+
+        <!-- RESUMEN GENERAL -->
+        <div class="section-title">Resumen General</div>
+        <div class="row"><span>Base de Caja</span><span>${fmt(baseCaja)}</span></div>
+        <div class="row"><span>Total Ventas</span><span>${fmt(totalVentas)}</span></div>
+        <hr class="divider-dash">
+        <div class="row"><span>Recaudo Efectivo</span><span>${fmt(efe)}</span></div>
+        <div class="row"><span>Recaudo Transferencia</span><span>${fmt(tra)}</span></div>
+        <div class="row bold large"><span>Total Recaudado</span><span>${fmt(totalRecaudado)}</span></div>
+        <div class="row"><span>Total Gastos</span><span>${fmt(totalGastos)}</span></div>
+        <div class="row highlight"><span>NETO DEL TURNO</span><span>${fmt(neto)}</span></div>
+
+        <!-- MESEROS -->
+        <hr class="divider-solid">
+        <div class="section-title">Estado de Cuenta por Mesero</div>
+        ${waitersHtml}
+
+        <!-- INVENTARIO -->
+        <hr class="divider-solid">
+        <div class="section-title">Inventario Actual</div>
+        ${invHtml}
+
+        <!-- GASTOS -->
+        <hr class="divider-solid">
+        <div class="section-title">Gastos del Turno</div>
+        ${gastosHtml}
+
+        <!-- PIE -->
+        <hr class="divider-solid">
+        <div class="footer">FIN DEL CIERRE DE TURNO</div>
+
+      </div>
+    </body>
+    </html>
+  `;
+
+  const w = window.open('', '_blank', 'width=480,height=720');
+  w.document.write(html);
+  w.document.close();
+  w.focus();
+  setTimeout(() => w.print(), 600);
+}
+
+// ══════════════════════════════════════════════
+// CIERRE DE TURNO — Función unificada
+// ══════════════════════════════════════════════
+function cierreDeTurno() {
+  if (!confirm('⚠️ CIERRE DE TURNO\n\nEsto imprimirá el reporte y eliminará:\n• Pedido en curso\n• Historial de pedidos\n• Gastos registrados\n• Recaudos registrados\n\nEl inventario y los meseros se conservarán.\n\n¿Confirmar cierre?')) return;
+
+  // Imprimir cierre
+  printCierre();
+
+  // Limpiar datos del turno
+  currentOrder = { items: [], waiterId: null, customerId: null };
+  state.orders = [];
+  state.gastos = [];
+  state.recaudos = [];
+  setTurnoCerrado(false); // ya no queda como cerrado: se inicia uno nuevo
+  saveState();
+
+  // ── Firebase Analytics: registrar cierre de turno ─────────
+  if (window._firebase && window._firebase.ready) {
+    window._firebase.logEvent('shift_closed', { timestamp: new Date().toISOString() });
+  }
+
+  // Mostrar modal de nueva base de caja
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.id = 'modalNuevoTurno';
+  overlay.innerHTML = `
+    <div class="modal" style="text-align:center;max-width:340px;">
+      <div style="font-size:2rem;margin-bottom:6px;">🍺</div>
+      <h3 style="margin-bottom:6px;">NUEVO TURNO</h3>
+      <p style="color:var(--text-muted);font-size:.88rem;margin-bottom:18px;letter-spacing:.5px;">Ingresa la base de caja para iniciar</p>
+      <div class="form-group" style="text-align:left;">
+        <label>Base de Caja ($)</label>
+        <input type="number" id="nuevaBaseInput" class="no-letter-spacing" placeholder="0" min="0"
+          style="font-size:1.1rem;text-align:center;"
+          onkeydown="if(event.key==='Enter')confirmarNuevoTurno()">
+      </div>
+      <div style="display:flex;gap:10px;margin-top:16px;">
+        <button class="btn btn-primary" style="flex:1;padding:13px;font-size:1rem;letter-spacing:1px;" onclick="confirmarNuevoTurno()">INICIAR TURNO</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  setTimeout(() => document.getElementById('nuevaBaseInput').focus(), 100);
+}
+
+function confirmarNuevoTurno() {
+  const input = document.getElementById('nuevaBaseInput');
+  const base = parseFloat(input ? input.value : '');
+  if (isNaN(base) || base < 0) {
+    notify('Ingresa un valor de base válido', 'error');
+    return;
+  }
+  baseCaja = base;
+  saveState();
+  const overlay = document.getElementById('modalNuevoTurno');
+  if (overlay) overlay.remove();
+  // Asegurar sesión de admin activa
+  appLocked = false;
+  currentWaiterSession = null;
+  adminUnlocked = false;
+  updateHeaderForSession();
+  switchModuleDirect('ventas');
+  renderAll();
+  notify('Nuevo turno iniciado ✓', 'success');
+}
+
+// Cambio de módulo sin depender del event global
+function switchModuleDirect(mod) {
+  document.querySelectorAll('.module').forEach(m => m.classList.remove('active'));
+  document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+  const modEl = document.getElementById('mod' + mod.charAt(0).toUpperCase() + mod.slice(1));
+  if (modEl) modEl.classList.add('active');
+  const tabEl = Array.from(document.querySelectorAll('.nav-tab')).find(t => t.textContent.toLowerCase().includes(mod));
+  if (tabEl) tabEl.classList.add('active');
+}
+
+// ══════════════════════════════════════════════
+// UTILS
+// ══════════════════════════════════════════════
+function fmt(n) { return '$' + (n || 0).toLocaleString('es-CO'); }
+function notify(msg, type = 'info') {
+  const el = document.createElement('div');
+  el.className = `notif ${type}`;
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3000);
+}
+function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
+
+// ══════════════════════════════════════════════
+// TECLADO VIRTUAL FLOTANTE — UNIVERSAL
+// Cubre: text, number, password (no file, no select)
+// ══════════════════════════════════════════════
+(function() {
+
+  // ── Layouts ──────────────────────────────────
+  // Alfanumérico QWERTY (text, password)
+  // pad: desplazamiento en px para el escalonado real de cada fila
+  const ALPHA_ROWS = [
+    { keys: ['1','2','3','4','5','6','7','8','9','0','-','@'], pad: 0  },
+    { keys: ['Q','W','E','R','T','Y','U','I','O','P'],          pad: 0  },
+    { keys: ['A','S','D','F','G','H','J','K','L','Ñ'],     pad: 28 },
+    { keys: ['Z','X','C','V','B','N','M','.',',','!'],           pad: 56 },
+  ];
+  // Numérico (number)
+  const NUM_ROWS = [
+    ['7','8','9'],
+    ['4','5','6'],
+    ['1','2','3'],
+    ['0','.','-'],
+  ];
+
+  let activeInput  = null;
+  let currentMode  = 'alpha'; // 'alpha' | 'num'
+
+  // ── Crear el DOM del teclado ─────────────────
+  const kb = document.createElement('div');
+  kb.id = 'vKeyboard';
+  kb.innerHTML = `
+    <div class="vk-header" id="vkHeader">
+      <span class="vk-title" id="vkTitle">⌨ TECLADO</span>
+      <button class="vk-close" id="vkClose" title="Cerrar">✕</button>
+    </div>
+    <div id="vkRows"></div>
+    <div class="vk-indicator" id="vkIndicator"></div>
+  `;
+  document.body.appendChild(kb);
+
+  const rowsDiv = document.getElementById('vkRows');
+
+  // ── Construir filas de teclas ─────────────────
+  function buildLayout(mode) {
+    rowsDiv.innerHTML = '';
+    const rows = (mode === 'num') ? NUM_ROWS : ALPHA_ROWS;
+
+    rows.forEach(row => {
+      const div = document.createElement('div');
+      div.className = 'vk-row';
+      // Soporte para filas con escalonado QWERTY (objeto {keys, pad}) o array plano (numérico)
+      const keys = Array.isArray(row) ? row : row.keys;
+      const pad  = Array.isArray(row) ? 0   : (row.pad || 0);
+      if (pad) div.style.paddingLeft = pad + 'px';
+      if (Array.isArray(row)) div.style.justifyContent = 'center';
+      keys.forEach(k => {
+        const btn = document.createElement('button');
+        btn.className = 'vk-key' + (mode === 'num' ? ' vk-key-num' : '');
+        btn.textContent = k;
+        btn.addEventListener('mousedown', e => { e.preventDefault(); insertChar(k); });
+        div.appendChild(btn);
+      });
+      rowsDiv.appendChild(div);
+    });
+
+    // Fila de control
+    const ctrl = document.createElement('div');
+    ctrl.className = 'vk-row';
+    ctrl.style.justifyContent = 'center';
+    if (mode === 'num') {
+      ctrl.innerHTML = `
+        <button class="vk-key vk-key-num wider" id="vkBackspace">&#x232B; BORRAR</button>
+        <button class="vk-key vk-key-num enter" id="vkEnter" style="min-width:94px">&#x21B5; ENTER</button>
+        <button class="vk-key vk-key-num wider del" id="vkClear">&#x2715; LIMPIAR</button>
+      `;
+    } else {
+      ctrl.innerHTML = `
+        <button class="vk-key wider" id="vkBackspace">&#x232B; BORRAR</button>
+        <button class="vk-key space"  id="vkSpace">ESPACIO</button>
+        <button class="vk-key enter" id="vkEnter">&#x21B5; ENTER</button>
+        <button class="vk-key wider del" id="vkClear">&#x2715; LIMPIAR</button>
+      `;
+      rowsDiv.querySelector && null; // placeholder
+    }
+    rowsDiv.appendChild(ctrl);
+
+    // Bind botones de control
+    document.getElementById('vkBackspace').addEventListener('mousedown', e => { e.preventDefault(); doBackspace(); });
+    document.getElementById('vkClear').addEventListener('mousedown', e => { e.preventDefault(); doClear(); });
+    const sp = document.getElementById('vkSpace');
+    if (sp) sp.addEventListener('mousedown', e => { e.preventDefault(); insertChar(' '); });
+    const en = document.getElementById('vkEnter');
+    if (en) en.addEventListener('mousedown', e => { e.preventDefault(); doEnter(); });
+  }
+
+  // ── Operaciones sobre el input activo ────────
+  function insertChar(ch) {
+    if (!activeInput) return;
+    const el = activeInput;
+    // Para type=number manipulamos el valor directamente
+    const isNum = el.type === 'number';
+    if (isNum) {
+      // Evitar múltiples puntos o guiones
+      if (ch === '.' && el.value.includes('.')) return;
+      if (ch === '-' && el.value.length > 0) return;
+      el.value = el.value + ch;
+    } else {
+      const s = el.selectionStart, e2 = el.selectionEnd;
+      el.value = el.value.slice(0, s) + ch + el.value.slice(e2);
+      el.selectionStart = el.selectionEnd = s + ch.length;
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    updateIndicator();
+  }
+
+  function doBackspace() {
+    if (!activeInput) return;
+    const el = activeInput;
+    if (el.type === 'number') {
+      el.value = el.value.slice(0, -1);
+    } else {
+      const s = el.selectionStart, e2 = el.selectionEnd;
+      if (s === e2 && s > 0) {
+        el.value = el.value.slice(0, s - 1) + el.value.slice(e2);
+        el.selectionStart = el.selectionEnd = s - 1;
+      } else if (s !== e2) {
+        el.value = el.value.slice(0, s) + el.value.slice(e2);
+        el.selectionStart = el.selectionEnd = s;
+      }
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    updateIndicator();
+  }
+
+  function doClear() {
+    if (!activeInput) return;
+    activeInput.value = '';
+    activeInput.dispatchEvent(new Event('input', { bubbles: true }));
+    activeInput.dispatchEvent(new Event('change', { bubbles: true }));
+    updateIndicator();
+  }
+
+  function doEnter() {
+    if (!activeInput) return;
+    // Simular pulsación de Enter: primero disparar keydown/keypress/keyup
+    const kd = new KeyboardEvent('keydown',  { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true });
+    const kp = new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true });
+    const ku = new KeyboardEvent('keyup',    { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true });
+    activeInput.dispatchEvent(kd);
+    activeInput.dispatchEvent(kp);
+    activeInput.dispatchEvent(ku);
+    // Si el input está dentro de un form, intentar submit
+    const form = activeInput.closest('form');
+    if (form) {
+      const submitBtn = form.querySelector('[type="submit"]');
+      if (submitBtn) submitBtn.click();
+    }
+    hideKeyboard();
+  }
+
+  // ── Indicador ─────────────────────────────────
+  function updateIndicator() {
+    const ind = document.getElementById('vkIndicator');
+    if (!activeInput) { ind.textContent = ''; return; }
+    const t = activeInput.type;
+    // No mostrar valor en campos password
+    if (t === 'password') {
+      const n = activeInput.value.length;
+      ind.textContent = n ? '●'.repeat(n) : '';
+    } else {
+      const v = activeInput.value;
+      ind.textContent = v ? '▸ ' + v : '';
+    }
+  }
+
+  // ── Determinar modo según tipo de input ───────
+  function modeFor(el) {
+    return (el.type === 'number') ? 'num' : 'alpha';
+  }
+
+  // ── Etiqueta de contexto ──────────────────────
+  function labelFor(el) {
+    // Buscar label asociado o placeholder
+    const lbl = el.labels && el.labels[0];
+    if (lbl) return '⌨ ' + lbl.textContent.trim().toUpperCase();
+    if (el.placeholder) return '⌨ ' + el.placeholder.toUpperCase();
+    const t = el.type;
+    if (t === 'number') return '⌨ NUMÉRICO';
+    if (t === 'password') return '⌨ CONTRASEÑA';
+    return '⌨ TECLADO';
+  }
+
+  // ── Mostrar / ocultar ─────────────────────────
+  function showKeyboard(input) {
+    activeInput = input;
+    const mode = modeFor(input);
+    if (mode !== currentMode) {
+      currentMode = mode;
+      buildLayout(mode);
+    }
+    document.getElementById('vkTitle').textContent = labelFor(input);
+    kb.style.display = 'flex';
+    updateIndicator();
+  }
+
+  function hideKeyboard() {
+    kb.style.display = 'none';
+    activeInput = null;
+    document.getElementById('vkIndicator').textContent = '';
+  }
+
+  // ── Detección de dispositivo táctil ──────────
+  // El teclado virtual solo se activa en desktop (mouse).
+  // En smartphones y tablets el SO ya provee su propio teclado.
+  const isTouchDevice = (
+    navigator.maxTouchPoints > 0 ||
+    window.matchMedia('(pointer: coarse)').matches
+  );
+
+  if (isTouchDevice) {
+    // Ocultar el elemento del teclado virtual por completo
+    kb.style.display = 'none';
+    kb.style.visibility = 'hidden';
+    // NO adjuntar ningún listener ni bloquear el inputmode nativo
+    // → el teclado del SO funcionará con normalidad
+    return; // salir del IIFE sin inicializar nada más
+  }
+
+  // ── Attach a un input ─────────────────────────
+  function attachToInput(el) {
+    if (el._vkAttached) return;
+    const t = el.type || 'text';
+    // Excluir: file, submit, button, checkbox, radio, range, color, date…
+    if (['file','submit','button','checkbox','radio','range','color',
+         'date','datetime-local','time','month','week','image','reset','hidden'].includes(t)) return;
+    el._vkAttached = true;
+    el.addEventListener('focus', () => showKeyboard(el));
+    el.addEventListener('input', updateIndicator);
+    // Bloquear teclado nativo del SO solo en desktop (nunca en touch)
+    el.setAttribute('inputmode', 'none');
+  }
+
+  // ── Escaneo + MutationObserver ─────────────────
+  function scanInputs() {
+    document.querySelectorAll('input, textarea').forEach(attachToInput);
+  }
+
+  // Build layout inicial
+  buildLayout('alpha');
+
+  scanInputs();
+  const mo = new MutationObserver(scanInputs);
+  mo.observe(document.body, { childList: true, subtree: true });
+
+  // ── Cerrar al click fuera ──────────────────────
+  document.getElementById('vkClose').addEventListener('mousedown', e => { e.preventDefault(); hideKeyboard(); });
+  document.getElementById('vkClose').addEventListener('touchstart', e => { e.preventDefault(); hideKeyboard(); });
+
+  document.addEventListener('mousedown', e => {
+    if (kb.style.display === 'none') return;
+    if (!kb.contains(e.target) && e.target !== activeInput) {
+      hideKeyboard();
+    }
+  }, true);
+  document.addEventListener('touchstart', e => {
+    if (kb.style.display === 'none') return;
+    if (!kb.contains(e.target) && e.target !== activeInput) {
+      hideKeyboard();
+    }
+  }, true);
+
+  // ── Drag (mouse + touch) ──────────────────────
+  let dragging = false, dragOffX = 0, dragOffY = 0;
+  document.getElementById('vkHeader').addEventListener('mousedown', e => {
+    if (e.target.id === 'vkClose') return;
+    dragging = true;
+    const rect = kb.getBoundingClientRect();
+    kb.style.left      = rect.left + 'px';
+    kb.style.bottom    = 'auto';
+    kb.style.top       = rect.top  + 'px';
+    kb.style.transform = 'none';
+    dragOffX = e.clientX - rect.left;
+    dragOffY = e.clientY - rect.top;
+    e.preventDefault();
+  });
+  document.getElementById('vkHeader').addEventListener('touchstart', e => {
+    if (e.target.id === 'vkClose') return;
+    dragging = true;
+    const touch = e.touches[0];
+    const rect = kb.getBoundingClientRect();
+    kb.style.left      = rect.left + 'px';
+    kb.style.bottom    = 'auto';
+    kb.style.top       = rect.top  + 'px';
+    kb.style.transform = 'none';
+    dragOffX = touch.clientX - rect.left;
+    dragOffY = touch.clientY - rect.top;
+    e.preventDefault();
+  }, { passive: false });
+  document.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    kb.style.left = (e.clientX - dragOffX) + 'px';
+    kb.style.top  = (e.clientY - dragOffY) + 'px';
+  });
+  document.addEventListener('touchmove', e => {
+    if (!dragging) return;
+    const touch = e.touches[0];
+    kb.style.left = (touch.clientX - dragOffX) + 'px';
+    kb.style.top  = (touch.clientY - dragOffY) + 'px';
+  }, { passive: false });
+  document.addEventListener('mouseup', () => { dragging = false; });
+  document.addEventListener('touchend', () => { dragging = false; });
+
+})();
+
+// ══════════════════════════════════════════════
+// INIT
+// ══════════════════════════════════════════════
+renderAll();
+
+// ══════════════════════════════════════════════
+// CONTROL DE INICIO DE TURNO
+// Solo mostrar la pantalla de inicio si se ha cerrado un turno previamente.
+// En la primera apertura (sin cierre registrado) se salta directamente a la app.
+// ══════════════════════════════════════════════
+(function initTurnoCheck() {
+  // ── Siempre cerrar todas las sesiones al abrir la app ──
+  appLocked = true;
+  adminUnlocked = false;
+  currentWaiterSession = null;
+  setAppLockedFlag(false); // limpiar bandera de cierre
+
+  // Asegurarse que el paso 1 sea el visible al mostrar lockScreen
+  document.getElementById('lockStep1').style.display = 'flex';
+  document.getElementById('lockStep2Admin').style.display = 'none';
+  document.getElementById('lockStep2Mesero').style.display = 'none';
+  document.getElementById('lockStep2Cliente').style.display = 'none';
+
+  // Siempre mostrar la pantalla de inicio de turno / login
+  if (getTurnoCerrado()) {
+    // Turno cerrado previamente → pantalla de inicio de turno normal
+    document.getElementById('lockScreen').style.display = 'flex';
+  } else {
+    // Primera apertura o sin turno cerrado → igual se pide login
+    document.getElementById('lockScreen').style.display = 'flex';
+  }
+
+  updateHeaderForSession();
+})();
+
+// ══════════════════════════════════════════════
+// BLOQUEO AUTOMÁTICO AL CERRAR / SALIR DE LA APP
+// Los datos NO se borran; solo se activa el bloqueo.
+// ══════════════════════════════════════════════
+function setAppLockedFlag(val) {
+  try { localStorage.setItem('appLockedOnClose', val ? 'true' : 'false'); } catch {}
+}
+function getAppLockedFlag() {
+  try { return localStorage.getItem('appLockedOnClose') === 'true'; } catch { return false; }
+}
+
+// Guardar estado y marcar como bloqueada antes de cerrar/recargar
+window.addEventListener('beforeunload', function () {
+  saveState();
+  setAppLockedFlag(true);
+  currentWaiterSession = null;
+  adminUnlocked = false;
+});
+
+// También bloquear cuando el usuario cambia de pestaña o minimiza
+document.addEventListener('visibilitychange', function () {
+  if (document.visibilityState === 'hidden') {
+    saveState();
+    setAppLockedFlag(true);
+    currentWaiterSession = null;
+    adminUnlocked = false;
+  }
+});
+
+// Compatibilidad iOS / móvil
+window.addEventListener('pagehide', function () {
+  saveState();
+  setAppLockedFlag(true);
+  currentWaiterSession = null;
+  adminUnlocked = false;
+});
+
+}
+</script>
+</body>
+</html>
