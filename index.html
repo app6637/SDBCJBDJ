@@ -1644,6 +1644,24 @@ let currentOrder = (() => {
   } catch {}
   return { items: [], waiterId: null };
 })();
+
+// Carga el pedido activo de un mesero específico desde su clave privada de localStorage
+function loadWaiterOrder(waiterId) {
+  try {
+    const key = 'posCurrentOrder_w' + waiterId;
+    const saved = JSON.parse(localStorage.getItem(key));
+    if (saved && Array.isArray(saved.items)) return saved;
+  } catch {}
+  return { items: [], waiterId: waiterId };
+}
+
+// Guarda el pedido activo en la clave privada del mesero
+function saveWaiterOrder(waiterId, order) {
+  try {
+    const key = 'posCurrentOrder_w' + waiterId;
+    localStorage.setItem(key, JSON.stringify(order));
+  } catch {}
+}
 // Exponer en window para que los handlers inline del HTML puedan acceder
 window.currentOrder = currentOrder;
 window.state = state;
@@ -1679,12 +1697,17 @@ function loadState() {
 function saveState() {
   try {
     localStorage.setItem('posState', JSON.stringify(state));
-    localStorage.setItem('posCurrentOrder', JSON.stringify(currentOrder));
+    // El pedido activo se guarda por clave privada de mesero (no se sincroniza entre dispositivos)
+    if (currentWaiterSession) {
+      saveWaiterOrder(currentWaiterSession.id, currentOrder);
+    } else {
+      localStorage.setItem('posCurrentOrder', JSON.stringify(currentOrder));
+    }
     localStorage.setItem('posBaseCaja', String(baseCaja));
   } catch {}
   if (window._firebase && window._firebase.ready) {
-    // Guardar estado general (pedidos, meseros, clientes…)
-    window._firebase.saveState(state, currentOrder).catch(() => {});
+    // Guardar estado general (pedidos, meseros, clientes…) — sin incluir pedido activo
+    window._firebase.saveState(state, null).catch(() => {});
     // Guardar inventario en documento dedicado para sync inmediata
     window._firebase.saveInventory(state.inventory).catch(() => {});
   }
@@ -1761,12 +1784,11 @@ window._posApplyState = function(data) {
   renderAll();
 };
 
-// Pedido activo
+// Pedido activo: NO se sincroniza entre dispositivos/meseros.
+// Cada mesero guarda su pedido en una clave privada de localStorage.
 window._posApplyCurrentOrder = function(data) {
-  if (appLocked || !data || !Array.isArray(data.items)) return;
-  if (currentOrder.items && currentOrder.items.length > 0) return; // no sobreescribir
-  Object.assign(currentOrder, data);
-  renderOrderPanel();
+  // Deshabilitado intencionalmente: el pedido activo es privado por mesero
+  // y no se sincroniza en tiempo real entre dispositivos.
 };
 
 // ══════════════════════════════════════════════
@@ -1824,14 +1846,8 @@ async function _initFromFirebase() {
       await window._firebase.saveState(state, currentOrder).catch(() => {});
     }
 
-    // 3. Cargar pedido activo
-    const fbOrder = await window._firebase.loadCurrentOrder();
-    if (fbOrder && Array.isArray(fbOrder.items) && fbOrder.items.length > 0) {
-      if (!currentOrder.items || currentOrder.items.length === 0) {
-        Object.assign(currentOrder, fbOrder);
-        renderOrderPanel();
-      }
-    }
+    // 3. Pedido activo: es privado por mesero, no se carga desde Firebase.
+    // Se carga desde localStorage al hacer login (loadWaiterOrder).
 
     // 4. Iniciar escuchas en tiempo real
     window._firebase.startRealtime();
@@ -1941,6 +1957,8 @@ function unlockAsMesero() {
   setTurnoCerrado(false);
   document.getElementById('lockScreen').style.display = 'none';
   updateHeaderForSession();
+  // Cargar el pedido privado de este mesero
+  Object.assign(currentOrder, loadWaiterOrder(waiter.id));
   currentOrder.waiterId = waiter.id;
   goToVentas();
   renderAll();
@@ -2024,10 +2042,9 @@ function renderMisClientes() {
     ? `<div style="background:rgba(192,57,43,.1);border:1px solid rgba(192,57,43,.35);border-radius:7px;padding:9px 13px;font-size:.85rem;color:var(--red);text-align:center;margin-top:8px;">⚠️ Tienes un saldo pendiente de entrega: <strong>${fmt(wPendiente)}</strong></div>`
     : `<div style="background:rgba(39,174,96,.08);border:1px solid rgba(39,174,96,.3);border-radius:7px;padding:9px 13px;font-size:.85rem;color:var(--green);text-align:center;margin-top:8px;">✅ Estás al día. Sin saldos pendientes.</div>`;
 
-  // ── Clientes atendidos ─────────────────────────
-  const myCustomerIds = new Set(state.orders.filter(o => o.waiterId === currentWaiterSession.id && o.customerId).map(o => o.customerId));
+  // ── Clientes registrados por este mesero ─────────────
   const customers = (state.customers || []).filter(c =>
-    myCustomerIds.has(c.id) &&
+    c.createdByWaiterId === currentWaiterSession.id &&
     (!q || c.name.toLowerCase().includes(q) || (c.contact||'').toLowerCase().includes(q) || (c.clientCode||'').toLowerCase().includes(q))
   );
 
@@ -2056,6 +2073,10 @@ function renderMisClientes() {
 }
 
 function lockApp() {
+  // Guardar el pedido activo del mesero en su clave privada antes de cerrar sesión
+  if (currentWaiterSession) {
+    saveWaiterOrder(currentWaiterSession.id, currentOrder);
+  }
   adminUnlocked = false;
   currentWaiterSession = null;
   const rs = document.getElementById('relockScreen');
@@ -2135,6 +2156,8 @@ function reUnlockAsMesero() {
   currentWaiterSession = { id: waiter.id, name: waiter.name };
   document.getElementById('relockScreen').style.display = 'none';
   updateHeaderForSession();
+  // Cargar el pedido privado de este mesero
+  Object.assign(currentOrder, loadWaiterOrder(waiter.id));
   currentOrder.waiterId = waiter.id;
   goToVentas();
   renderAll();
@@ -2331,6 +2354,7 @@ function clearOrder() {
   currentOrder.customerId = null;
   const sel = document.getElementById('orderCustomer');
   if (sel) sel.value = '';
+  if (currentWaiterSession) saveWaiterOrder(currentWaiterSession.id, currentOrder);
   saveState();
   renderOrderPanel();
 }
@@ -2384,8 +2408,12 @@ function renderCustomerSelect() {
   const sel = document.getElementById('orderCustomer');
   if (!sel) return;
   const cur = sel.value || (currentOrder.customerId ? String(currentOrder.customerId) : '');
+  // Si hay sesión de mesero, solo mostrar los clientes que él registró
+  const visibleCustomers = currentWaiterSession
+    ? (state.customers || []).filter(c => c.createdByWaiterId === currentWaiterSession.id)
+    : (state.customers || []);
   sel.innerHTML = '<option value="">— Seleccionar Cliente * —</option>' +
-    (state.customers || []).map(c => `<option value="${c.id}" ${cur == c.id ? 'selected' : ''}>${c.name}</option>`).join('');
+    visibleCustomers.map(c => `<option value="${c.id}" ${cur == c.id ? 'selected' : ''}>${c.name}</option>`).join('');
 }
 
 function dispatchOrder() {
@@ -2436,6 +2464,7 @@ function dispatchOrder() {
   currentOrder.items = [];
   currentOrder.customerId = null;
   document.getElementById('orderCustomer').value = '';
+  if (currentWaiterSession) saveWaiterOrder(currentWaiterSession.id, currentOrder);
   renderAll();
   notify(`Pedido #${orderId} despachado ✓`, 'success');
 }
@@ -2796,6 +2825,7 @@ function saveNewCustomer() {
     contact,
     clientCode,
     createdAt: new Date().toLocaleString('es-CO'),
+    createdByWaiterId: currentWaiterSession ? currentWaiterSession.id : null,
   };
   if (!state.customers) state.customers = [];
   state.customers.push(customer);
@@ -2815,12 +2845,11 @@ function renderClientes() {
   const tb = document.getElementById('clientesTbody');
   if (!tb) return;
   const q = (document.getElementById('clientSearch')?.value || '').toLowerCase();
-  // Admin sees all; mesero sees only their clients
+  // Admin sees all; mesero sees only their own registered clients
   let customers = (state.customers || []).filter(c => !q || c.name.toLowerCase().includes(q) || (c.contact||'').toLowerCase().includes(q) || (c.clientCode||'').toLowerCase().includes(q));
   if (currentWaiterSession) {
-    // Filter customers that have at least one order from this waiter
-    const myCustomerIds = new Set(state.orders.filter(o => o.waiterId === currentWaiterSession.id && o.customerId).map(o => o.customerId));
-    customers = customers.filter(c => myCustomerIds.has(c.id));
+    // Mesero solo ve clientes que él mismo registró
+    customers = customers.filter(c => c.createdByWaiterId === currentWaiterSession.id);
   }
 
   if (!customers.length) {
@@ -3966,6 +3995,7 @@ function getAppLockedFlag() {
 
 // Guardar estado y marcar como bloqueada antes de cerrar/recargar
 window.addEventListener('beforeunload', function () {
+  if (currentWaiterSession) saveWaiterOrder(currentWaiterSession.id, currentOrder);
   saveState();
   setAppLockedFlag(true);
   currentWaiterSession = null;
@@ -3975,6 +4005,7 @@ window.addEventListener('beforeunload', function () {
 // También bloquear cuando el usuario cambia de pestaña o minimiza
 document.addEventListener('visibilitychange', function () {
   if (document.visibilityState === 'hidden') {
+    if (currentWaiterSession) saveWaiterOrder(currentWaiterSession.id, currentOrder);
     saveState();
     setAppLockedFlag(true);
     currentWaiterSession = null;
@@ -3984,6 +4015,7 @@ document.addEventListener('visibilitychange', function () {
 
 // Compatibilidad iOS / móvil
 window.addEventListener('pagehide', function () {
+  if (currentWaiterSession) saveWaiterOrder(currentWaiterSession.id, currentOrder);
   saveState();
   setAppLockedFlag(true);
   currentWaiterSession = null;
