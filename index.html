@@ -11,7 +11,8 @@
   import { initializeApp }          from "https://www.gstatic.com/firebasejs/11.8.1/firebase-app.js";
   import { getAnalytics, logEvent } from "https://www.gstatic.com/firebasejs/11.8.1/firebase-analytics.js";
   import {
-    getFirestore, doc, setDoc, getDoc, onSnapshot, serverTimestamp
+    getFirestore, doc, setDoc, getDoc, onSnapshot, serverTimestamp,
+    collection, getDocs
   } from "https://www.gstatic.com/firebasejs/11.8.1/firebase-firestore.js";
 
   // ── Configuración ──────────────────────────────────────────
@@ -29,47 +30,43 @@
   const analytics = getAnalytics(fbApp);
   const db        = getFirestore(fbApp);
 
+
   // ── Documentos Firestore ──────────────────────────────────
-  // pos/terraza      → estado general (pedidos, meseros, clientes, gastos, recaudos)
-  // pos/inventory    → inventario SEPARADO para sync rápida e independiente
-  // pos/currentOrder → pedido activo
-  // pos/images       → imágenes de productos { [productId]: base64 } (sync entre usuarios)
+  // pos/terraza          → estado general
+  // pos/inventory        → inventario sin imágenes
+  // pos/currentOrder     → pedido activo
+  // product_images/{id}  → una imagen por producto (colección separada)
   const STATE_DOC   = doc(db, "pos", "terraza");
   const INV_DOC     = doc(db, "pos", "inventory");
   const ORDER_DOC   = doc(db, "pos", "currentOrder");
-  const IMAGES_DOC  = doc(db, "pos", "images");
+  const IMAGES_COL  = collection(db, "product_images");
 
   // ── Banderas anti-bucle ────────────────────────────────────
-  let _writingState  = false;
-  let _writingInv    = false;
-  let _writingOrder  = false;
-  let _writingImages = false;
+  let _writingState = false;
+  let _writingInv   = false;
+  let _writingOrder = false;
 
-  // ── Caché local de imágenes (id → base64) ─────────────────
-  // Se llena al cargar y se actualiza en tiempo real
+  // ── Caché local: String(productId) → base64 ───────────────
   let _imagesCache = {};
 
-  // ── Comprimir imagen antes de subir ───────────────────────
-  // Redimensiona a máx 300×300 px y comprime a JPEG 0.65
-  // para que cada imagen ocupe ~15-40 KB en base64
-  function compressImage(base64, maxSize, quality) {
+  // ── Comprimir imagen (máx 320px, JPEG 0.70) ───────────────
+  function compressImage(base64) {
     return new Promise(resolve => {
       if (!base64) { resolve(null); return; }
-      const img = new Image();
-      img.onload = () => {
+      const imgEl = new Image();
+      imgEl.onload = () => {
         const canvas = document.createElement('canvas');
-        let w = img.width, h = img.height;
-        const ms = maxSize || 300;
+        let w = imgEl.width, h = imgEl.height, ms = 320;
         if (w > ms || h > ms) {
           if (w > h) { h = Math.round(h * ms / w); w = ms; }
           else       { w = Math.round(w * ms / h); h = ms; }
         }
         canvas.width = w; canvas.height = h;
-        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
-        resolve(canvas.toDataURL('image/jpeg', quality || 0.65));
+        canvas.getContext('2d').drawImage(imgEl, 0, 0, w, h);
+        resolve(canvas.toDataURL('image/jpeg', 0.70));
       };
-      img.onerror = () => resolve(base64); // fallback: sin comprimir
-      img.src = base64;
+      imgEl.onerror = () => resolve(base64);
+      imgEl.src = base64;
     });
   }
 
@@ -77,7 +74,6 @@
   // GUARDAR
   // ══════════════════════════════════════════════
 
-  // Guarda SOLO el inventario (sin imágenes — van en pos/images)
   async function fbSaveInventory(inventory) {
     if (_writingInv) return;
     _writingInv = true;
@@ -88,26 +84,18 @@
     finally { _writingInv = false; }
   }
 
-  // Guarda imágenes de uno o varios productos { [id]: base64 }
-  // Usa merge:true para no borrar las imágenes de otros productos
-  async function fbSaveImages(imagesMap) {
-    if (_writingImages || !imagesMap || !Object.keys(imagesMap).length) return;
-    _writingImages = true;
+  // Guarda la imagen de UN producto en product_images/{id}
+  async function fbSaveImage(productId, base64) {
+    if (!productId || !base64) return;
     try {
-      // Comprimir cada imagen antes de subir
-      const compressed = {};
-      for (const [id, b64] of Object.entries(imagesMap)) {
-        compressed[id] = b64 ? await compressImage(b64) : null;
-      }
-      // merge:true conserva imágenes de otros productos
-      await setDoc(IMAGES_DOC, { ...compressed, _updatedAt: serverTimestamp() }, { merge: true });
-      // Actualizar caché local
-      Object.assign(_imagesCache, compressed);
-    } catch (e) { console.warn('[Firebase] Error guardando imágenes:', e); }
-    finally { _writingImages = false; }
+      const compressed = await compressImage(base64);
+      const imgRef = doc(db, "product_images", String(productId));
+      await setDoc(imgRef, { img: compressed, _updatedAt: serverTimestamp() });
+      _imagesCache[String(productId)] = compressed;
+      console.log('[Firebase] ✅ Imagen sincronizada, producto', productId);
+    } catch (e) { console.warn('[Firebase] Error guardando imagen producto ' + productId + ':', e); }
   }
 
-  // Guarda el estado general SIN inventario (pedidos, meseros, clientes…)
   async function fbSaveState(stateObj, currentOrderObj) {
     if (_writingState) return;
     _writingState = true;
@@ -116,7 +104,6 @@
       await setDoc(STATE_DOC, { ...stateWithoutInv, _updatedAt: serverTimestamp() });
     } catch (e) { console.warn('[Firebase] Error guardando estado:', e); }
     finally { _writingState = false; }
-
     if (_writingOrder) return;
     _writingOrder = true;
     try {
@@ -128,25 +115,27 @@
   // ══════════════════════════════════════════════
   // CARGAR (primera vez)
   // ══════════════════════════════════════════════
+
+  // Descarga TODAS las imágenes de la colección y llena _imagesCache
+  async function fbLoadImages() {
+    try {
+      const snap = await getDocs(IMAGES_COL);
+      snap.forEach(d => {
+        const data = d.data();
+        if (data.img) _imagesCache[d.id] = data.img;
+      });
+      console.log('[Firebase] Imágenes cargadas:', Object.keys(_imagesCache).length);
+      return _imagesCache;
+    } catch (e) { console.warn('[Firebase] Error cargando imágenes:', e); return {}; }
+  }
+
   async function fbLoadInventory() {
     try {
       const snap = await getDoc(INV_DOC);
       if (!snap.exists()) return null;
       const data = snap.data();
-      // Inyectar imágenes desde caché (_imagesCache ya debe estar cargado)
-      return (data.items || []).map(i => ({ ...i, img: _imagesCache[i.id] || null }));
+      return (data.items || []).map(i => ({ ...i, img: _imagesCache[String(i.id)] || null }));
     } catch (e) { console.warn('[Firebase] Error cargando inventario:', e); return null; }
-  }
-
-  async function fbLoadImages() {
-    try {
-      const snap = await getDoc(IMAGES_DOC);
-      if (!snap.exists()) return {};
-      const data = snap.data();
-      delete data._updatedAt;
-      _imagesCache = data || {};
-      return _imagesCache;
-    } catch (e) { console.warn('[Firebase] Error cargando imágenes:', e); return {}; }
   }
 
   async function fbLoadState() {
@@ -178,27 +167,29 @@
   let _unsubImages = null;
 
   function fbStartRealtime() {
-    // ── Imágenes: aplicar a inventario en tiempo real ──────
+    // ── Imágenes: escucha la colección completa ────────────
     if (_unsubImages) _unsubImages();
-    _unsubImages = onSnapshot(IMAGES_DOC, snap => {
-      if (!snap.exists() || _writingImages) return;
-      const data = snap.data();
-      if (!data) return;
-      delete data._updatedAt;
-      _imagesCache = { ..._imagesCache, ...data };
+    _unsubImages = onSnapshot(IMAGES_COL, snap => {
+      snap.docChanges().forEach(change => {
+        if (change.type === 'removed') {
+          delete _imagesCache[change.doc.id];
+        } else {
+          const d = change.doc.data();
+          if (d.img) _imagesCache[change.doc.id] = d.img;
+        }
+      });
       if (typeof window._posApplyImages === 'function') {
-        window._posApplyImages(_imagesCache);
+        window._posApplyImages({ ..._imagesCache });
       }
     }, err => console.warn('[Firebase] onSnapshot imágenes:', err));
 
-    // ── Inventario: sync INMEDIATA en cada cambio ──────────
+    // ── Inventario ─────────────────────────────────────────
     if (_unsubInv) _unsubInv();
     _unsubInv = onSnapshot(INV_DOC, snap => {
       if (!snap.exists() || _writingInv) return;
       const data = snap.data();
       if (!data || !data.items) return;
-      // Inyectar imágenes desde caché
-      const items = (data.items || []).map(i => ({ ...i, img: _imagesCache[i.id] || null }));
+      const items = (data.items || []).map(i => ({ ...i, img: _imagesCache[String(i.id)] || null }));
       if (typeof window._posApplyInventory === 'function') {
         window._posApplyInventory(items);
       }
@@ -236,7 +227,7 @@
   // ── API pública ───────────────────────────────────────────
   window._firebase = {
     saveInventory:    fbSaveInventory,
-    saveImages:       fbSaveImages,
+    saveImage:        fbSaveImage,
     saveState:        fbSaveState,
     loadInventory:    fbLoadInventory,
     loadImages:       fbLoadImages,
@@ -1793,17 +1784,17 @@ async function _initFromFirebase() {
       // Aplicar imágenes remotas al inventario local
       state.inventory = (state.inventory || []).map(item => ({
         ...item,
-        img: fbImages[item.id] || item.img || null
+        img: fbImages[String(item.id)] || item.img || null
       }));
       try { localStorage.setItem('posState', JSON.stringify(state)); } catch {}
       renderProducts();
       renderInventory();
     } else {
-      // Primera vez o sin imágenes remotas: subir imágenes locales que existan
-      const localImgs = {};
-      (state.inventory || []).forEach(i => { if (i.img) localImgs[i.id] = i.img; });
-      if (Object.keys(localImgs).length > 0) {
-        await window._firebase.saveImages(localImgs).catch(() => {});
+      // Primera vez: subir imágenes locales que existan (una por una)
+      for (const item of (state.inventory || [])) {
+        if (item.img) {
+          await window._firebase.saveImage(item.id, item.img).catch(() => {});
+        }
       }
     }
 
@@ -3040,7 +3031,7 @@ function addInventoryItem() {
   document.getElementById('invImgPreview').innerHTML = '📷';
   // Sincronizar imagen con todos los usuarios
   if (invImgData && window._firebase && window._firebase.ready) {
-    window._firebase.saveImages({ [newId]: invImgData }).catch(() => {});
+    window._firebase.saveImage(newId, invImgData).catch(() => {});
   }
   invImgData = null;
   saveState(); renderAll();
@@ -3075,7 +3066,7 @@ function saveEdit() {
   if (editImgData) item.img = editImgData;
   // Sincronizar imagen nueva con todos los usuarios
   if (imgChanged && window._firebase && window._firebase.ready) {
-    window._firebase.saveImages({ [id]: editImgData }).catch(() => {});
+    window._firebase.saveImage(id, editImgData).catch(() => {});
   }
   closeModal('editModal');
   saveState(); renderAll();
