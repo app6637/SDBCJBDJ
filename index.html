@@ -33,29 +33,43 @@
   // pos/terraza      → estado general (pedidos, meseros, clientes, gastos, recaudos)
   // pos/inventory    → inventario SEPARADO para sync rápida e independiente
   // pos/currentOrder → pedido activo
+  // pos/images       → imágenes de productos { [productId]: base64 } (sync entre usuarios)
   const STATE_DOC   = doc(db, "pos", "terraza");
   const INV_DOC     = doc(db, "pos", "inventory");
   const ORDER_DOC   = doc(db, "pos", "currentOrder");
+  const IMAGES_DOC  = doc(db, "pos", "images");
 
   // ── Banderas anti-bucle ────────────────────────────────────
-  // Separadas por colección para no bloquear unas a otras
-  let _writingState = false;
-  let _writingInv   = false;
-  let _writingOrder = false;
+  let _writingState  = false;
+  let _writingInv    = false;
+  let _writingOrder  = false;
+  let _writingImages = false;
 
-  // ── Helpers de imagen ─────────────────────────────────────
-  function stripImgs(inventory) {
-    return (inventory || []).map(i => ({ ...i, img: i.img ? '__IMG__' : null }));
-  }
-  function restoreImgs(fbInventory) {
-    const local = (() => { try { return JSON.parse(localStorage.getItem('posState')); } catch { return null; } })();
-    const localInv = local ? (local.inventory || []) : [];
-    return (fbInventory || []).map(fi => {
-      if (fi.img === '__IMG__') {
-        const li = localInv.find(i => i.id === fi.id);
-        return { ...fi, img: li ? li.img : null };
-      }
-      return fi;
+  // ── Caché local de imágenes (id → base64) ─────────────────
+  // Se llena al cargar y se actualiza en tiempo real
+  let _imagesCache = {};
+
+  // ── Comprimir imagen antes de subir ───────────────────────
+  // Redimensiona a máx 300×300 px y comprime a JPEG 0.65
+  // para que cada imagen ocupe ~15-40 KB en base64
+  function compressImage(base64, maxSize, quality) {
+    return new Promise(resolve => {
+      if (!base64) { resolve(null); return; }
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        let w = img.width, h = img.height;
+        const ms = maxSize || 300;
+        if (w > ms || h > ms) {
+          if (w > h) { h = Math.round(h * ms / w); w = ms; }
+          else       { w = Math.round(w * ms / h); h = ms; }
+        }
+        canvas.width = w; canvas.height = h;
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL('image/jpeg', quality || 0.65));
+      };
+      img.onerror = () => resolve(base64); // fallback: sin comprimir
+      img.src = base64;
     });
   }
 
@@ -63,17 +77,34 @@
   // GUARDAR
   // ══════════════════════════════════════════════
 
-  // Guarda SOLO el inventario (stock, precios, orden, productos nuevos/eliminados)
+  // Guarda SOLO el inventario (sin imágenes — van en pos/images)
   async function fbSaveInventory(inventory) {
     if (_writingInv) return;
     _writingInv = true;
     try {
-      await setDoc(INV_DOC, {
-        items: stripImgs(inventory),
-        _updatedAt: serverTimestamp()
-      });
+      const items = (inventory || []).map(i => ({ ...i, img: null }));
+      await setDoc(INV_DOC, { items, _updatedAt: serverTimestamp() });
     } catch (e) { console.warn('[Firebase] Error guardando inventario:', e); }
     finally { _writingInv = false; }
+  }
+
+  // Guarda imágenes de uno o varios productos { [id]: base64 }
+  // Usa merge:true para no borrar las imágenes de otros productos
+  async function fbSaveImages(imagesMap) {
+    if (_writingImages || !imagesMap || !Object.keys(imagesMap).length) return;
+    _writingImages = true;
+    try {
+      // Comprimir cada imagen antes de subir
+      const compressed = {};
+      for (const [id, b64] of Object.entries(imagesMap)) {
+        compressed[id] = b64 ? await compressImage(b64) : null;
+      }
+      // merge:true conserva imágenes de otros productos
+      await setDoc(IMAGES_DOC, { ...compressed, _updatedAt: serverTimestamp() }, { merge: true });
+      // Actualizar caché local
+      Object.assign(_imagesCache, compressed);
+    } catch (e) { console.warn('[Firebase] Error guardando imágenes:', e); }
+    finally { _writingImages = false; }
   }
 
   // Guarda el estado general SIN inventario (pedidos, meseros, clientes…)
@@ -86,7 +117,6 @@
     } catch (e) { console.warn('[Firebase] Error guardando estado:', e); }
     finally { _writingState = false; }
 
-    // Guardar pedido activo
     if (_writingOrder) return;
     _writingOrder = true;
     try {
@@ -103,8 +133,20 @@
       const snap = await getDoc(INV_DOC);
       if (!snap.exists()) return null;
       const data = snap.data();
-      return restoreImgs(data.items || []);
+      // Inyectar imágenes desde caché (_imagesCache ya debe estar cargado)
+      return (data.items || []).map(i => ({ ...i, img: _imagesCache[i.id] || null }));
     } catch (e) { console.warn('[Firebase] Error cargando inventario:', e); return null; }
+  }
+
+  async function fbLoadImages() {
+    try {
+      const snap = await getDoc(IMAGES_DOC);
+      if (!snap.exists()) return {};
+      const data = snap.data();
+      delete data._updatedAt;
+      _imagesCache = data || {};
+      return _imagesCache;
+    } catch (e) { console.warn('[Firebase] Error cargando imágenes:', e); return {}; }
   }
 
   async function fbLoadState() {
@@ -130,18 +172,33 @@
   // ══════════════════════════════════════════════
   // ESCUCHA EN TIEMPO REAL
   // ══════════════════════════════════════════════
-  let _unsubInv   = null;
-  let _unsubState = null;
-  let _unsubOrder = null;
+  let _unsubInv    = null;
+  let _unsubState  = null;
+  let _unsubOrder  = null;
+  let _unsubImages = null;
 
   function fbStartRealtime() {
+    // ── Imágenes: aplicar a inventario en tiempo real ──────
+    if (_unsubImages) _unsubImages();
+    _unsubImages = onSnapshot(IMAGES_DOC, snap => {
+      if (!snap.exists() || _writingImages) return;
+      const data = snap.data();
+      if (!data) return;
+      delete data._updatedAt;
+      _imagesCache = { ..._imagesCache, ...data };
+      if (typeof window._posApplyImages === 'function') {
+        window._posApplyImages(_imagesCache);
+      }
+    }, err => console.warn('[Firebase] onSnapshot imágenes:', err));
+
     // ── Inventario: sync INMEDIATA en cada cambio ──────────
     if (_unsubInv) _unsubInv();
     _unsubInv = onSnapshot(INV_DOC, snap => {
       if (!snap.exists() || _writingInv) return;
       const data = snap.data();
       if (!data || !data.items) return;
-      const items = restoreImgs(data.items);
+      // Inyectar imágenes desde caché
+      const items = (data.items || []).map(i => ({ ...i, img: _imagesCache[i.id] || null }));
       if (typeof window._posApplyInventory === 'function') {
         window._posApplyInventory(items);
       }
@@ -179,8 +236,10 @@
   // ── API pública ───────────────────────────────────────────
   window._firebase = {
     saveInventory:    fbSaveInventory,
+    saveImages:       fbSaveImages,
     saveState:        fbSaveState,
     loadInventory:    fbLoadInventory,
+    loadImages:       fbLoadImages,
     loadState:        fbLoadState,
     loadCurrentOrder: fbLoadCurrentOrder,
     startRealtime:    fbStartRealtime,
@@ -1250,7 +1309,7 @@ main { padding-top: 50px; }
           <div class="form-grid">
             <div class="form-group">
               <label>Mesero</label>
-              <select id="recMesero">
+              <select id="recMesero" onchange="updateRecClienteSelect()">
                 <option value="">— Seleccionar —</option>
               </select>
             </div>
@@ -1259,6 +1318,12 @@ main { padding-top: 50px; }
               <select id="recTipo">
                 <option value="efectivo">💵 Efectivo</option>
                 <option value="transferencia">📱 Transferencia</option>
+              </select>
+            </div>
+            <div class="form-group" style="grid-column:1/-1;">
+              <label>Cliente</label>
+              <select id="recCliente">
+                <option value="">— Selecciona primero un mesero —</option>
               </select>
             </div>
             <div class="form-group" style="grid-column:1/-1;">
@@ -1274,7 +1339,7 @@ main { padding-top: 50px; }
         <div class="card">
           <div class="card-title">Historial de Recaudos</div>
           <div class="data-table-wrapper"><table class="data-table">
-            <thead><tr><th>Fecha</th><th>Mesero</th><th>Tipo</th><th>Monto</th></tr></thead>
+            <thead><tr><th>Fecha</th><th>Mesero</th><th>Cliente</th><th>Tipo</th><th>Monto</th></tr></thead>
             <tbody id="recaudosTbody"></tbody>
           </table></div>
           <div style="margin-top:12px;display:flex;gap:16px;">
@@ -1588,6 +1653,9 @@ let currentOrder = (() => {
   } catch {}
   return { items: [], waiterId: null };
 })();
+// Exponer en window para que los handlers inline del HTML puedan acceder
+window.currentOrder = currentOrder;
+window.state = state;
 let currentCat = 'all';
 let editImgData = null;
 let invImgData = null;
@@ -1647,12 +1715,8 @@ function saveInventory() {
 // Inventario: aplica inmediatamente sin verificar versión
 window._posApplyInventory = function(items) {
   if (!items || !Array.isArray(items)) return;
-  // Preservar imágenes locales que no se suben a Firestore
-  const merged = items.map(fi => {
-    const local = (state.inventory || []).find(i => i.id === fi.id);
-    return { ...fi, img: fi.img || (local ? local.img : null) };
-  });
-  state.inventory = merged;
+  // Las imágenes ya vienen inyectadas desde _imagesCache en Firebase SDK
+  state.inventory = items;
   try { localStorage.setItem('posState', JSON.stringify(state)); } catch {}
   renderProducts();
   renderInventory();
@@ -1665,6 +1729,34 @@ window._posApplyInventory = function(items) {
     window._fbIndicatorTimer = setTimeout(() => {
       if (el) { el.textContent = '🔥 Firebase ✓'; }
     }, 2000);
+  }
+};
+
+// Imágenes: cuando otro usuario sube/cambia una imagen
+window._posApplyImages = function(imagesCache) {
+  if (!imagesCache) return;
+  let changed = false;
+  state.inventory = (state.inventory || []).map(item => {
+    const remoteImg = imagesCache[item.id];
+    if (remoteImg && remoteImg !== item.img) {
+      changed = true;
+      return { ...item, img: remoteImg };
+    }
+    return item;
+  });
+  if (changed) {
+    try { localStorage.setItem('posState', JSON.stringify(state)); } catch {}
+    renderProducts();
+    renderInventory();
+    const el = document.getElementById('fbStatusIndicator');
+    if (el) {
+      el.textContent = '🔥 Imágenes ↺';
+      el.style.color = '#F5A623';
+      clearTimeout(window._fbIndicatorTimer);
+      window._fbIndicatorTimer = setTimeout(() => {
+        if (el) { el.textContent = '🔥 Firebase ✓'; }
+      }, 2000);
+    }
   }
 };
 
@@ -1695,15 +1787,30 @@ async function _initFromFirebase() {
   try {
     if (el) { el.textContent = '🔥 Conectando...'; el.style.color = '#F5A623'; }
 
-    // 1. Cargar inventario desde Firestore (documento dedicado)
+    // 0. Cargar imágenes PRIMERO (se necesitan para inyectarlas en el inventario)
+    const fbImages = await window._firebase.loadImages();
+    if (fbImages && Object.keys(fbImages).length > 0) {
+      // Aplicar imágenes remotas al inventario local
+      state.inventory = (state.inventory || []).map(item => ({
+        ...item,
+        img: fbImages[item.id] || item.img || null
+      }));
+      try { localStorage.setItem('posState', JSON.stringify(state)); } catch {}
+      renderProducts();
+      renderInventory();
+    } else {
+      // Primera vez o sin imágenes remotas: subir imágenes locales que existan
+      const localImgs = {};
+      (state.inventory || []).forEach(i => { if (i.img) localImgs[i.id] = i.img; });
+      if (Object.keys(localImgs).length > 0) {
+        await window._firebase.saveImages(localImgs).catch(() => {});
+      }
+    }
+
+    // 1. Cargar inventario desde Firestore (las imágenes ya están en _imagesCache)
     const fbInventory = await window._firebase.loadInventory();
     if (fbInventory && fbInventory.length > 0) {
-      // Merge: usar Firestore como fuente de verdad para inventario
-      const merged = fbInventory.map(fi => {
-        const local = (state.inventory || []).find(i => i.id === fi.id);
-        return { ...fi, img: fi.img || (local ? local.img : null) };
-      });
-      state.inventory = merged;
+      state.inventory = fbInventory;
       try { localStorage.setItem('posState', JSON.stringify(state)); } catch {}
       renderProducts();
       renderInventory();
@@ -1723,7 +1830,6 @@ async function _initFromFirebase() {
         renderAll();
       }
     } else {
-      // Primera vez: subir estado completo
       await window._firebase.saveState(state, currentOrder).catch(() => {});
     }
 
@@ -2548,6 +2654,7 @@ function printRecaudoInvoice(rec) {
       <div class="info-line"><b>Recaudo #:</b> ${rec.id}</div>
       <div class="info-line"><b>Fecha:</b> ${rec.date}</div>
       <div class="info-line"><b>Mesero:</b> ${rec.waiterName}</div>
+      <div class="info-line"><b>Cliente:</b> ${rec.customerName || '—'}</div>
       <div class="info-line"><b>Tipo de pago:</b> ${rec.tipo === 'efectivo' ? 'Efectivo' : 'Transferencia'}</div>
       <hr class="divider">
       <div class="monto-box">MONTO: ${fmt(rec.monto)}</div>
@@ -2924,12 +3031,17 @@ function addInventoryItem() {
   const price = parseFloat(document.getElementById('invPrice').value);
   const qty = parseInt(document.getElementById('invQty').value);
   if (!name || isNaN(price) || isNaN(qty)) { notify('Completa todos los campos', 'error'); return; }
-  state.inventory.push({ id: ++state.nextId, name, cat, price, qty, img: invImgData || null });
+  const newId = ++state.nextId;
+  state.inventory.push({ id: newId, name, cat, price, qty, img: invImgData || null });
   document.getElementById('invName').value = '';
   document.getElementById('invPrice').value = '';
   document.getElementById('invQty').value = '';
   document.getElementById('invImg').value = '';
   document.getElementById('invImgPreview').innerHTML = '📷';
+  // Sincronizar imagen con todos los usuarios
+  if (invImgData && window._firebase && window._firebase.ready) {
+    window._firebase.saveImages({ [newId]: invImgData }).catch(() => {});
+  }
   invImgData = null;
   saveState(); renderAll();
   notify('Artículo agregado ✓', 'success');
@@ -2959,7 +3071,12 @@ function saveEdit() {
   item.cat = document.getElementById('editCat').value;
   item.price = parseFloat(document.getElementById('editPrice').value);
   item.qty = parseInt(document.getElementById('editQty').value);
+  const imgChanged = editImgData && editImgData !== item.img;
   if (editImgData) item.img = editImgData;
+  // Sincronizar imagen nueva con todos los usuarios
+  if (imgChanged && window._firebase && window._firebase.ready) {
+    window._firebase.saveImages({ [id]: editImgData }).catch(() => {});
+  }
   closeModal('editModal');
   saveState(); renderAll();
   notify('Artículo actualizado ✓', 'success');
@@ -3016,15 +3133,48 @@ function loadExcel() {
 // ══════════════════════════════════════════════
 // RECAUDOS
 // ══════════════════════════════════════════════
+function updateRecClienteSelect() {
+  const waiterId = document.getElementById('recMesero').value;
+  const sel = document.getElementById('recCliente');
+  if (!sel) return;
+  if (!waiterId) {
+    sel.innerHTML = '<option value="">— Selecciona primero un mesero —</option>';
+    return;
+  }
+  const myCustomerIds = new Set(
+    state.orders.filter(o => o.waiterId == waiterId && o.customerId).map(o => o.customerId)
+  );
+  const myCustomers = (state.customers || []).filter(c => myCustomerIds.has(c.id));
+  if (!myCustomers.length) {
+    sel.innerHTML = '<option value="">— Sin clientes para este mesero —</option>';
+    return;
+  }
+  sel.innerHTML = '<option value="">— Seleccionar Cliente —</option>' +
+    myCustomers.map(c => `<option value="${c.id}">${c.name}</option>`).join('');
+}
+
 function addRecaudo() {
   const waiterId = document.getElementById('recMesero').value;
   const tipo = document.getElementById('recTipo').value;
   const monto = parseFloat(document.getElementById('recMonto').value);
+  const customerId = document.getElementById('recCliente').value;
   if (!waiterId || isNaN(monto) || monto <= 0) { notify('Completa todos los campos', 'error'); return; }
+  if (!customerId) { notify('Selecciona un cliente', 'error'); return; }
   const waiter = state.waiters.find(w => w.id == waiterId);
-  const rec = { id: ++state.nextId, date: new Date().toLocaleString('es-CO'), waiterId: waiter.id, waiterName: waiter.name, tipo, monto };
+  const customer = (state.customers || []).find(c => c.id == customerId);
+  const rec = {
+    id: ++state.nextId,
+    date: new Date().toLocaleString('es-CO'),
+    waiterId: waiter.id,
+    waiterName: waiter.name,
+    customerId: customer ? customer.id : null,
+    customerName: customer ? customer.name : null,
+    tipo,
+    monto
+  };
   state.recaudos.push(rec);
   document.getElementById('recMonto').value = '';
+  document.getElementById('recCliente').innerHTML = '<option value="">— Selecciona primero un mesero —</option>';
   saveState(); renderAll();
   printRecaudoInvoice(rec);
   notify('Recaudo registrado ✓', 'success');
@@ -3038,10 +3188,11 @@ function renderRecaudos() {
     return `<tr>
       <td>${r.date}</td>
       <td>${r.waiterName}</td>
+      <td>${r.customerName ? `<span class="badge badge-blue">${r.customerName}</span>` : '<span style="color:var(--text-muted)">—</span>'}</td>
       <td><span class="badge ${r.tipo === 'efectivo' ? 'badge-green' : 'badge-blue'}">${r.tipo}</span></td>
       <td>${fmt(r.monto)}</td>
     </tr>`;
-  }).join('') || '<tr><td colspan="4" style="text-align:center;color:var(--text-muted)">Sin recaudos</td></tr>';
+  }).join('') || '<tr><td colspan="5" style="text-align:center;color:var(--text-muted)">Sin recaudos</td></tr>';
   const te = document.getElementById('totalEfectivo');
   const tt = document.getElementById('totalTransferencia');
   if (te) te.textContent = fmt(efe);
@@ -3382,6 +3533,7 @@ function cierreDeTurno() {
 
   // Limpiar datos del turno
   currentOrder = { items: [], waiterId: null, customerId: null };
+  window.currentOrder = currentOrder;
   state.orders = [];
   state.gastos = [];
   state.recaudos = [];
