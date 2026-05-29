@@ -1416,8 +1416,9 @@ main { padding-top: 50px; }
 
       <!-- ESTADO DE CUENTA DEL MESERO -->
       <div class="card" id="misWaiterAccountCard" style="border-color:rgba(212,168,67,0.4);background:rgba(212,168,67,0.04);">
-        <div class="card-title" style="display:flex;align-items:center;gap:8px;">
+        <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
           <span id="misWaiterAccountName">📊 MI ESTADO DE CUENTA</span>
+          <span style="background:rgba(192,57,43,.18);border:1px solid rgba(192,57,43,.5);color:#e74c3c;font-size:.68rem;padding:2px 7px;border-radius:10px;font-weight:700;letter-spacing:1px;font-family:'Barlow Condensed',sans-serif;">🔴 EN VIVO</span>
         </div>
         <div id="misWaiterAccountGrid" style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:12px;"></div>
         <div id="misWaiterAccountBanner"></div>
@@ -1425,7 +1426,10 @@ main { padding-top: 50px; }
 
       <!-- CLIENTES ATENDIDOS -->
       <div class="card">
-        <div class="card-title">Estado de Cuenta — Clientes Atendidos</div>
+        <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+          <span>Estado de Cuenta — Mis Clientes</span>
+          <span style="background:rgba(192,57,43,.18);border:1px solid rgba(192,57,43,.5);color:#e74c3c;font-size:.68rem;padding:2px 7px;border-radius:10px;font-weight:700;letter-spacing:1px;font-family:'Barlow Condensed',sans-serif;">🔴 EN VIVO</span>
+        </div>
         <div style="display:flex;gap:10px;margin-bottom:12px;">
           <input type="text" id="misClientSearch" placeholder="Buscar cliente..." style="flex:1;background:var(--dark4);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:4px;outline:none;" oninput="renderMisClientes()">
         </div>
@@ -1500,7 +1504,10 @@ main { padding-top: 50px; }
 <!-- MODAL ESTADO DE CUENTA CLIENTE (admin/mesero) -->
 <div class="modal-overlay hidden" id="clientAccountModal">
   <div class="modal" style="min-width:340px;max-width:540px;">
-    <h3 id="camClientName" style="margin-bottom:4px;">📊 ESTADO DE CUENTA</h3>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+      <h3 id="camClientName" style="margin-bottom:0;">📊 ESTADO DE CUENTA</h3>
+      <span style="background:rgba(192,57,43,.18);border:1px solid rgba(192,57,43,.5);color:#e74c3c;font-size:.68rem;padding:2px 8px;border-radius:10px;font-weight:700;letter-spacing:1px;font-family:'Barlow Condensed',sans-serif;white-space:nowrap;">🔴 EN VIVO</span>
+    </div>
     <p id="camClientInfo" style="color:var(--text-muted);font-size:.82rem;margin-bottom:14px;"></p>
     <div id="camSummaryGrid" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px;"></div>
     <div id="camPendBanner" style="margin-bottom:14px;"></div>
@@ -1511,7 +1518,7 @@ main { padding-top: 50px; }
     <div style="font-family:'Barlow Condensed',sans-serif;font-size:.82rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--text-muted);margin-bottom:8px;">💵 PAGOS RECIBIDOS</div>
     <div id="camRecaudosList" style="max-height:160px;overflow-y:auto;display:flex;flex-direction:column;gap:5px;"></div>
     <div class="modal-actions" style="justify-content:flex-end;margin-top:16px;">
-      <button class="btn btn-secondary" onclick="closeModal('clientAccountModal')">Cerrar</button>
+      <button class="btn btn-secondary" onclick="closeClientAccountModal()">Cerrar</button>
     </div>
   </div>
 </div>
@@ -1782,6 +1789,16 @@ window._posApplyState = function(data) {
   Object.assign(state, migratedData);
   try { localStorage.setItem('posState', JSON.stringify(state)); } catch {}
   renderAll();
+  // Actualizar el modal de estado de cuenta si está abierto
+  _refreshClientAccountModal();
+  // Indicador visual de sincronización
+  const el = document.getElementById('fbStatusIndicator');
+  if (el) {
+    el.textContent = '🔥 Sync ↺';
+    el.style.color = '#F5A623';
+    clearTimeout(window._fbStateTimer);
+    window._fbStateTimer = setTimeout(() => { if (el) el.textContent = '🔥 Firebase ✓'; }, 2000);
+  }
 };
 
 // Pedido activo: NO se sincroniza entre dispositivos/meseros.
@@ -2412,7 +2429,10 @@ function renderCustomerSelect() {
   const visibleCustomers = currentWaiterSession
     ? (state.customers || []).filter(c => c.createdByWaiterId === currentWaiterSession.id)
     : (state.customers || []);
-  sel.innerHTML = '<option value="">— Seleccionar Cliente * —</option>' +
+  const emptyLabel = currentWaiterSession && !visibleCustomers.length
+    ? '— Sin clientes (crea uno primero) —'
+    : '— Seleccionar Cliente * —';
+  sel.innerHTML = `<option value="">${emptyLabel}</option>` +
     visibleCustomers.map(c => `<option value="${c.id}" ${cur == c.id ? 'selected' : ''}>${c.name}</option>`).join('');
 }
 
@@ -2424,6 +2444,10 @@ function dispatchOrder() {
   const customerId = document.getElementById('orderCustomer').value;
   if (!customerId) { notify('Selecciona un cliente para el pedido', 'error'); return; }
   const customer = (state.customers || []).find(c => c.id == customerId);
+  // Validar que el cliente pertenezca al mesero actual
+  if (currentWaiterSession && customer && customer.createdByWaiterId !== currentWaiterSession.id) {
+    notify('Solo puedes despachar a tus propios clientes', 'error'); return;
+  }
   const total = currentOrder.items.reduce((s, i) => s + i.price * i.qty, 0);
   const orderId = ++state.nextId;
 
@@ -2944,8 +2968,20 @@ function buildRecaudosList(clientId) {
   }).join('');
 }
 
+// ID del cliente cuyo modal está abierto (para actualización en tiempo real)
+let _openClientAccountId = null;
+
 function showClientAccount(clientId) {
-  const data = getClientAccountData(clientId);
+  _openClientAccountId = clientId;
+  _refreshClientAccountModal();
+  document.getElementById('clientAccountModal').classList.remove('hidden');
+}
+
+function _refreshClientAccountModal() {
+  if (!_openClientAccountId) return;
+  const modal = document.getElementById('clientAccountModal');
+  if (!modal || modal.classList.contains('hidden')) return;
+  const data = getClientAccountData(_openClientAccountId);
   if (!data) return;
   const { c, cOrders, totalVentas, recaudado, pendiente } = data;
   document.getElementById('camClientName').textContent = '📊 ' + c.name;
@@ -2955,8 +2991,12 @@ function showClientAccount(clientId) {
     ? `<div style="background:rgba(192,57,43,.12);border:1px solid rgba(192,57,43,.4);border-radius:8px;padding:10px 14px;font-size:.88rem;color:var(--red);text-align:center;">⚠️ Saldo pendiente: <strong>${fmt(pendiente)}</strong></div>`
     : `<div style="background:rgba(39,174,96,.1);border:1px solid rgba(39,174,96,.3);border-radius:8px;padding:10px 14px;font-size:.88rem;color:var(--green);text-align:center;">✅ ¡Al día! Sin saldos pendientes.</div>`;
   document.getElementById('camOrdersList').innerHTML = buildOrdersList(cOrders);
-  document.getElementById('camRecaudosList').innerHTML = buildRecaudosList(clientId);
-  document.getElementById('clientAccountModal').classList.remove('hidden');
+  document.getElementById('camRecaudosList').innerHTML = buildRecaudosList(_openClientAccountId);
+}
+
+function closeClientAccountModal() {
+  _openClientAccountId = null;
+  closeModal('clientAccountModal');
 }
 
 // ── Portal Cliente (pantalla full) ────────────
