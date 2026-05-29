@@ -198,7 +198,9 @@
     // ── Estado general ─────────────────────────────────────
     if (_unsubState) _unsubState();
     _unsubState = onSnapshot(STATE_DOC, snap => {
-      if (!snap.exists() || _writingState) return;
+      if (!snap.exists()) return;
+      // Solo ignorar el eco local inmediato (mientras se está escribiendo activamente)
+      if (_writingState) return;
       const data = snap.data();
       delete data._updatedAt;
       if (!data) return;
@@ -2973,14 +2975,12 @@ let _openClientAccountId = null;
 
 function showClientAccount(clientId) {
   _openClientAccountId = clientId;
-  _refreshClientAccountModal();
   document.getElementById('clientAccountModal').classList.remove('hidden');
+  _refreshClientAccountModal();
 }
 
 function _refreshClientAccountModal() {
   if (!_openClientAccountId) return;
-  const modal = document.getElementById('clientAccountModal');
-  if (!modal || modal.classList.contains('hidden')) return;
   const data = getClientAccountData(_openClientAccountId);
   if (!data) return;
   const { c, cOrders, totalVentas, recaudado, pendiente } = data;
@@ -2998,6 +2998,11 @@ function closeClientAccountModal() {
   _openClientAccountId = null;
   closeModal('clientAccountModal');
 }
+
+// Polling de respaldo: refresca el modal cada 3 segundos si está abierto
+setInterval(function() {
+  if (_openClientAccountId) _refreshClientAccountModal();
+}, 3000);
 
 // ── Portal Cliente (pantalla full) ────────────
 function openClientPortal(code) {
