@@ -1189,6 +1189,7 @@ main { padding-top: 50px; }
       <!-- MESEROS -->
       <div id="secMeseros" class="admin-section active">
         <div class="section-title">👤 MESEROS</div>
+
         <div class="card">
           <div class="card-title">Agregar Mesero</div>
           <div class="form-grid" style="grid-template-columns:1fr 1fr;">
@@ -1234,6 +1235,37 @@ main { padding-top: 50px; }
             <div><span style="color:var(--text-muted);font-size:.85rem;">Total Ventas:</span> <strong id="waiterStatVentas" style="color:var(--gold)">$0</strong></div>
             <div><span style="color:var(--text-muted);font-size:.85rem;">Total Recaudado:</span> <strong id="waiterStatRecaudado" style="color:var(--green)">$0</strong></div>
             <div><span style="color:var(--text-muted);font-size:.85rem;">Total Pendiente:</span> <strong id="waiterStatPendiente" style="color:var(--red)">$0</strong></div>
+          </div>
+        </div>
+
+        <!-- CAMBIAR CONTRASEÑA MESERO -->
+        <div class="card" style="border-color:rgba(41,128,185,0.4);">
+          <div class="card-title">🔑 Cambiar Contraseña de Mesero</div>
+          <p style="font-size:.85rem;color:var(--text-muted);margin-bottom:14px;">Usa el botón <strong style="color:var(--text)">🔑 Contraseña</strong> en la fila de cada mesero en la tabla de arriba.</p>
+        </div>
+
+        <!-- CAMBIAR CONTRASEÑA ADMIN -->
+        <div class="card" style="border-color:rgba(212,168,67,0.4);">
+          <div class="card-title">🔐 Cambiar Contraseña de Administrador</div>
+          <div class="form-grid" style="grid-template-columns:1fr 1fr;">
+            <div class="form-group">
+              <label>Contraseña Actual</label>
+              <input type="password" id="adminPwActual" placeholder="••••" maxlength="20" autocomplete="off">
+            </div>
+            <div class="form-group" style="grid-column:1/-1;display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+              <div>
+                <label>Nueva Contraseña</label>
+                <input type="password" id="adminPwNueva" placeholder="••••" maxlength="20" autocomplete="off">
+              </div>
+              <div>
+                <label>Confirmar Nueva</label>
+                <input type="password" id="adminPwConfirm" placeholder="••••" maxlength="20" autocomplete="off">
+              </div>
+            </div>
+          </div>
+          <div id="adminPwMsg" style="min-height:18px;font-size:.85rem;margin-bottom:8px;"></div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="changeAdminPassword()">💾 GUARDAR CONTRASEÑA ADMIN</button>
           </div>
         </div>
       </div>
@@ -1524,6 +1556,28 @@ main { padding-top: 50px; }
   </div>
 </div>
 
+<!-- MODAL CAMBIAR CONTRASEÑA MESERO -->
+<div class="modal-overlay hidden" id="changeWaiterPwModal">
+  <div class="modal" style="min-width:340px;max-width:420px;">
+    <h3>🔑 CAMBIAR CONTRASEÑA</h3>
+    <input type="hidden" id="cwpWaiterId">
+    <p id="cwpWaiterName" style="color:var(--gold);font-family:'Barlow Condensed',sans-serif;font-size:1rem;letter-spacing:1px;margin-bottom:16px;"></p>
+    <div class="form-group">
+      <label>Nueva Contraseña</label>
+      <input type="password" id="cwpNueva" placeholder="••••" maxlength="20" autocomplete="off">
+    </div>
+    <div class="form-group">
+      <label>Confirmar Contraseña</label>
+      <input type="password" id="cwpConfirm" placeholder="••••" maxlength="20" autocomplete="off" onkeydown="if(event.key==='Enter')saveWaiterPassword()">
+    </div>
+    <div id="cwpMsg" style="min-height:18px;font-size:.85rem;margin-bottom:4px;"></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal('changeWaiterPwModal')">Cancelar</button>
+      <button class="btn btn-primary" onclick="saveWaiterPassword()">💾 GUARDAR</button>
+    </div>
+  </div>
+</div>
+
 <!-- PORTAL CLIENTE — Pantalla completa de estado de cuenta -->
 <div id="clientPortalScreen" style="display:none;position:fixed;inset:0;background:linear-gradient(135deg,#0D0D0D 0%,#1a1200 50%,#0D0D0D 100%);z-index:9998;overflow-y:auto;padding:0 0 40px;">
   <div style="max-width:480px;margin:0 auto;padding:0 16px;">
@@ -1558,7 +1612,7 @@ main { padding-top: 50px; }
 // ══════════════════════════════════════════════
 // STATE
 // ══════════════════════════════════════════════
-const ADMIN_PW = '0317';
+let ADMIN_PW = (() => { try { return localStorage.getItem('posAdminPw') || '0317'; } catch { return '0317'; } })();
 let appLocked = true;
 let adminUnlocked = false;
 let baseCaja = (() => { try { const v = parseFloat(localStorage.getItem('posBaseCaja')); return isNaN(v) ? 0 : v; } catch { return 0; } })();  // base de caja del turno
@@ -2766,6 +2820,79 @@ function deleteWaiter(id) {
   state.waiters = state.waiters.filter(w => w.id !== id);
   saveState(); renderAll();
 }
+
+function changeAdminPassword() {
+  const actual  = document.getElementById('adminPwActual').value;
+  const nueva   = document.getElementById('adminPwNueva').value.trim();
+  const confirm = document.getElementById('adminPwConfirm').value.trim();
+  const msg     = document.getElementById('adminPwMsg');
+
+  if (actual !== ADMIN_PW) {
+    msg.style.color = 'var(--red)';
+    msg.textContent = '❌ La contraseña actual es incorrecta.';
+    document.getElementById('adminPwActual').value = '';
+    return;
+  }
+  if (!nueva) {
+    msg.style.color = 'var(--red)';
+    msg.textContent = '❌ Ingresa la nueva contraseña.';
+    return;
+  }
+  if (nueva !== confirm) {
+    msg.style.color = 'var(--red)';
+    msg.textContent = '❌ Las contraseñas no coinciden.';
+    document.getElementById('adminPwConfirm').value = '';
+    return;
+  }
+  // Actualizar la variable
+  ADMIN_PW = nueva;
+  msg.style.color = 'var(--green)';
+  msg.textContent = '✅ Contraseña de administrador actualizada.';
+  document.getElementById('adminPwActual').value = '';
+  document.getElementById('adminPwNueva').value = '';
+  document.getElementById('adminPwConfirm').value = '';
+  // Guardar en localStorage para persistencia
+  try { localStorage.setItem('posAdminPw', nueva); } catch {}
+  setTimeout(() => { msg.textContent = ''; }, 3000);
+}
+
+function openChangeWaiterPw(id) {
+  const w = state.waiters.find(w => w.id === id);
+  if (!w) return;
+  document.getElementById('cwpWaiterId').value = id;
+  document.getElementById('cwpWaiterName').textContent = '👤 ' + w.name + ' (' + (w.username || '') + ')';
+  document.getElementById('cwpNueva').value = '';
+  document.getElementById('cwpConfirm').value = '';
+  document.getElementById('cwpMsg').textContent = '';
+  document.getElementById('changeWaiterPwModal').classList.remove('hidden');
+  setTimeout(() => document.getElementById('cwpNueva').focus(), 100);
+}
+
+function saveWaiterPassword() {
+  const id      = parseInt(document.getElementById('cwpWaiterId').value);
+  const nueva   = document.getElementById('cwpNueva').value.trim();
+  const confirm = document.getElementById('cwpConfirm').value.trim();
+  const msg     = document.getElementById('cwpMsg');
+
+  if (!nueva) {
+    msg.style.color = 'var(--red)';
+    msg.textContent = '❌ Ingresa la nueva contraseña.';
+    return;
+  }
+  if (nueva !== confirm) {
+    msg.style.color = 'var(--red)';
+    msg.textContent = '❌ Las contraseñas no coinciden.';
+    document.getElementById('cwpConfirm').value = '';
+    return;
+  }
+  const w = state.waiters.find(w => w.id === id);
+  if (!w) return;
+  w.password = nueva;
+  saveState();
+  msg.style.color = 'var(--green)';
+  msg.textContent = '✅ Contraseña actualizada.';
+  setTimeout(() => closeModal('changeWaiterPwModal'), 1200);
+}
 function renderWaiters() {
   const tb = document.getElementById('waitersTbody');
   if (!tb) return;
@@ -2776,7 +2903,10 @@ function renderWaiters() {
       <td>${w.name}</td>
       <td><span class="badge badge-blue">${w.username || '<em style="color:var(--text-muted)">—</em>'}</span></td>
       <td><span class="badge badge-gold">${orders}</span></td>
-      <td><button class="btn btn-danger" onclick="deleteWaiter(${w.id})">Eliminar</button></td>
+      <td style="display:flex;gap:6px;">
+        <button class="btn btn-secondary" style="font-size:.78rem;padding:5px 10px;" onclick="openChangeWaiterPw(${w.id})">🔑 Contraseña</button>
+        <button class="btn btn-danger" onclick="deleteWaiter(${w.id})">Eliminar</button>
+      </td>
     </tr>`;
   }).join('') || '<tr><td colspan="5" style="text-align:center;color:var(--text-muted)">Sin meseros</td></tr>';
   // also update recaudo select
