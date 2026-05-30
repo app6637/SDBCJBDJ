@@ -624,6 +624,7 @@ main { padding-top: 50px; height: 100svh; overflow: hidden; }
 .badge-red { background: rgba(192,57,43,.2); color: var(--red); }
 .badge-blue { background: rgba(41,128,185,.2); color: var(--blue); }
 .badge-gold { background: rgba(212,168,67,.2); color: var(--gold); }
+.badge-print { background: rgba(39,174,96,.15); color: var(--green); border: 1px solid rgba(39,174,96,.3); }
 
 /* IMG PREVIEW */
 .img-preview {
@@ -1466,7 +1467,7 @@ main { padding-top: 50px; }
         <div class="card">
           <div class="card-title">Pedidos Registrados</div>
           <div class="data-table-wrapper"><table class="data-table">
-            <thead><tr><th>ID</th><th>Fecha/Hora</th><th>Mesero</th><th>Items</th><th>Total</th><th>Acciones</th></tr></thead>
+            <thead><tr><th>ID</th><th>Fecha/Hora</th><th>Mesero</th><th>Items</th><th>Total</th><th>Impresión</th><th>Acciones</th></tr></thead>
             <tbody id="orderHistoryTbody"></tbody>
           </table></div>
         </div>
@@ -3585,16 +3586,38 @@ function deleteOrder(id) {
 function renderOrderHistory() {
   const tb = document.getElementById('orderHistoryTbody');
   if (!tb) return;
-  tb.innerHTML = [...state.orders].reverse().map(o => `
-    <tr>
+  tb.innerHTML = [...state.orders].reverse().map(o => {
+    const printed = o.printedAt ? true : false;
+    const printBadge = printed
+      ? `<span class="badge badge-green" title="Impreso el ${o.printedAt}" style="font-size:.72rem;white-space:nowrap;">✅ Impreso</span>`
+      : `<span class="badge badge-gold" style="font-size:.72rem;">⏳ Sin imprimir</span>`;
+    return `<tr>
       <td>#${o.id}</td>
       <td>${o.date}</td>
       <td>${o.waiterName}</td>
-      <td>${o.items.map(i => `${i.name}×${i.qty}`).join(', ')}</td>
+      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${o.items.map(i => `${i.name}×${i.qty}`).join(', ')}</td>
       <td><strong style="color:var(--gold)">${fmt(o.total)}</strong></td>
-      <td><button class="btn btn-danger" onclick="deleteOrder(${o.id})">🗑️</button></td>
-    </tr>
-  `).join('') || '<tr><td colspan="6" style="text-align:center;color:var(--text-muted)">Sin pedidos</td></tr>';
+      <td>${printBadge}</td>
+      <td style="display:flex;gap:5px;flex-wrap:wrap;">
+        <button class="btn btn-primary" style="font-size:.75rem;padding:5px 9px;" onclick="adminPrintOrder(${o.id})" title="Imprimir pedido">🖨️</button>
+        <button class="btn btn-danger" style="font-size:.75rem;padding:5px 9px;" onclick="deleteOrder(${o.id})">🗑️</button>
+      </td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="7" style="text-align:center;color:var(--text-muted)">Sin pedidos</td></tr>';
+}
+
+// ── Imprimir pedido desde administración (marca primera impresión) ──
+function adminPrintOrder(orderId) {
+  const order = state.orders.find(o => o.id === orderId);
+  if (!order) return;
+  // Marcar primera impresión si aún no fue impreso
+  const isFirstPrint = !order.printedAt;
+  if (isFirstPrint) {
+    order.printedAt = new Date().toLocaleString('es-CO');
+    saveState();
+    renderOrderHistory();
+  }
+  printInvoice(order);
 }
 
 // ══════════════════════════════════════════════
@@ -3867,7 +3890,7 @@ function printCierre() {
 // CIERRE DE TURNO — Función unificada
 // ══════════════════════════════════════════════
 function cierreDeTurno() {
-  if (!confirm('⚠️ CIERRE DE TURNO\n\nEsto imprimirá el reporte y eliminará:\n• Pedido en curso\n• Historial de pedidos\n• Gastos registrados\n• Recaudos registrados\n\nEl inventario y los meseros se conservarán.\n\n¿Confirmar cierre?')) return;
+  if (!confirm('⚠️ CIERRE DE TURNO\n\nEsto imprimirá el reporte y eliminará:\n• Pedido en curso\n• Historial de pedidos\n• Gastos registrados\n• Recaudos registrados\n• Lista de clientes atendidos\n\nEl inventario y los meseros se conservarán.\n\n¿Confirmar cierre?')) return;
 
   // Imprimir cierre
   printCierre();
@@ -3878,6 +3901,7 @@ function cierreDeTurno() {
   state.orders = [];
   state.gastos = [];
   state.recaudos = [];
+  state.customers = [];
   setTurnoCerrado(false); // ya no queda como cerrado: se inicia uno nuevo
   saveState();
 
