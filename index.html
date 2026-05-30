@@ -1263,6 +1263,7 @@ main { padding-top: 50px; }
                 <th>Total Ventas</th>
                 <th>Recaudado</th>
                 <th>Pendiente</th>
+                <th>Imprimir</th>
               </tr>
             </thead>
             <tbody id="waiterAccountTbody"></tbody>
@@ -2982,6 +2983,7 @@ function renderWaiterAccounts() {
       <td style="color:var(--gold);font-weight:700;">${fmt(ventas)}</td>
       <td style="color:var(--green);font-weight:600;">${fmt(recaudado)}</td>
       <td style="${pendClass};font-weight:700;">${pendiente > 0 ? fmt(pendiente) : '✔ Al día'}</td>
+      <td><button class="btn btn-primary" style="font-size:.75rem;padding:5px 9px;" onclick="printWaiterAccount(${w.id})" title="Imprimir estado de cuenta">🖨️</button></td>
     </tr>`;
   }).join('');
   const totPendiente = Math.max(0, totVentas - totRecaudado);
@@ -2991,6 +2993,127 @@ function renderWaiterAccounts() {
   if (sv) sv.textContent = fmt(totVentas);
   if (sr) sr.textContent = fmt(totRecaudado);
   if (sp) sp.textContent = totPendiente > 0 ? fmt(totPendiente) : '$0';
+}
+
+// ══════════════════════════════════════════════
+// IMPRIMIR ESTADO DE CUENTA — MESERO
+// ══════════════════════════════════════════════
+function printWaiterAccount(waiterId) {
+  const w = state.waiters.find(w => w.id === waiterId);
+  if (!w) return;
+
+  const wOrders   = state.orders.filter(o => o.waiterId === w.id);
+  const ventas    = wOrders.reduce((s, o) => s + o.total, 0);
+  const recaudado = state.recaudos.filter(r => r.waiterId === w.id).reduce((s, r) => s + r.monto, 0);
+  const pendiente = Math.max(0, ventas - recaudado);
+  const now       = new Date().toLocaleString('es-CO');
+
+  const css = `
+    @import url('https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;700&display=swap');
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { font-family:'Roboto Mono','Courier New',monospace; font-size:14px; color:#000; background:#fff;
+           -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+    .page { width:72mm; margin:0 auto; padding:8px 6px 16px; }
+    .biz-name { text-align:center; font-size:19px; font-weight:700; letter-spacing:1px;
+                text-transform:uppercase; margin-bottom:2px; }
+    .subtitle  { text-align:center; font-size:12px; color:#444; margin-bottom:2px; letter-spacing:1px; }
+    .date-line { text-align:center; font-size:11px; color:#555; margin-bottom:8px; }
+    .divider-solid { border:none; border-top:2px solid #000; margin:7px 0; }
+    .divider-dash  { border:none; border-top:2px dashed #000; margin:6px 0; }
+    .waiter-name { font-size:16px; font-weight:700; text-align:center; margin:6px 0 4px; letter-spacing:1px; text-transform:uppercase; }
+    .section-title { font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:1px; margin:8px 0 3px; }
+    .row { display:flex; justify-content:space-between; font-size:13px; padding:2px 0; }
+    .row.bold  { font-weight:700; }
+    .row.large { font-size:15px; font-weight:700; padding:3px 0; }
+    .row.highlight { font-size:16px; font-weight:700; border-top:2px solid #000; border-bottom:2px solid #000; padding:5px 0; margin:4px 0; }
+    .row.green { color:#1a7a1a; }
+    .row.red   { color:#a00; }
+    .order-block { font-size:12px; padding:2px 0 2px 6px; }
+    .order-block .order-items { font-size:11px; color:#444; padding-left:6px; }
+    .rec-row { font-size:12px; display:flex; justify-content:space-between; padding:2px 0; }
+    .footer { text-align:center; font-size:12px; font-weight:700; margin-top:10px; letter-spacing:2px; }
+    @media print { body { font-size:14px; } .page { padding:4px 4px 12px; } }
+  `;
+
+  // Pedidos del mesero
+  let ordersHtml = '';
+  if (!wOrders.length) {
+    ordersHtml = '<div style="font-size:12px;color:#555;">Sin pedidos en este turno.</div>';
+  } else {
+    wOrders.forEach(o => {
+      ordersHtml += `
+        <div class="order-block">
+          <div class="row"><span>#${o.id} — ${o.customerName || 'Cliente'}</span><span>${fmt(o.total)}</span></div>
+          <div class="order-items">${o.items.map(i => `${i.name} ×${i.qty}`).join(' | ')}</div>
+        </div>`;
+    });
+  }
+
+  // Recaudos del mesero
+  const wRecaudos = state.recaudos.filter(r => r.waiterId === w.id);
+  let recaudosHtml = '';
+  if (!wRecaudos.length) {
+    recaudosHtml = '<div style="font-size:12px;color:#555;">Sin recaudos registrados.</div>';
+  } else {
+    wRecaudos.forEach(r => {
+      recaudosHtml += `
+        <div class="rec-row">
+          <span>${r.tipo === 'efectivo' ? '💵 Efectivo' : '📲 Transfer.'} — ${r.customerName || '—'}</span>
+          <span>${fmt(r.monto)}</span>
+        </div>`;
+    });
+  }
+
+  const html = `
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+      <meta charset="UTF-8">
+      <title>Estado de Cuenta — ${w.name}</title>
+      <style>${css}</style>
+    </head>
+    <body>
+      <div class="page">
+        <div class="biz-name">TERRAZA LOS CADENAS</div>
+        <div class="subtitle">ESTADO DE CUENTA — MESERO</div>
+        <div class="date-line">${now}</div>
+        <hr class="divider-solid">
+        <div class="waiter-name">👤 ${w.name}</div>
+        <hr class="divider-dash">
+
+        <!-- RESUMEN -->
+        <div class="section-title">Resumen</div>
+        <div class="row"><span>Total Pedidos</span><span>${wOrders.length}</span></div>
+        <div class="row bold large"><span>Total Ventas</span><span>${fmt(ventas)}</span></div>
+        <div class="row"><span>Total Recaudado</span><span>${fmt(recaudado)}</span></div>
+        <div class="row highlight ${pendiente > 0 ? 'red' : 'green'}">
+          <span>${pendiente > 0 ? 'PENDIENTE' : 'AL DÍA ✔'}</span>
+          <span>${pendiente > 0 ? fmt(pendiente) : fmt(0)}</span>
+        </div>
+
+        <!-- PEDIDOS -->
+        <hr class="divider-solid">
+        <div class="section-title">Pedidos del Turno</div>
+        ${ordersHtml}
+
+        <!-- RECAUDOS -->
+        <hr class="divider-solid">
+        <div class="section-title">Recaudos Registrados</div>
+        ${recaudosHtml}
+
+        <!-- PIE -->
+        <hr class="divider-solid">
+        <div class="footer">FIN DEL ESTADO DE CUENTA</div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  const win = window.open('', '_blank', 'width=420,height=680');
+  win.document.write(html);
+  win.document.close();
+  win.focus();
+  setTimeout(() => win.print(), 600);
 }
 
 // ══════════════════════════════════════════════
