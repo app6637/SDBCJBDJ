@@ -14,6 +14,9 @@
     getFirestore, doc, setDoc, getDoc, onSnapshot, serverTimestamp,
     collection, getDocs
   } from "https://www.gstatic.com/firebasejs/11.8.1/firebase-firestore.js";
+  import {
+    getStorage, ref as storageRef, uploadString, getDownloadURL, deleteObject
+  } from "https://www.gstatic.com/firebasejs/11.8.1/firebase-storage.js";
 
   // ── Configuración ──────────────────────────────────────────
   const firebaseConfig = {
@@ -29,13 +32,14 @@
   const fbApp     = initializeApp(firebaseConfig);
   const analytics = getAnalytics(fbApp);
   const db        = getFirestore(fbApp);
-
+  const storage   = getStorage(fbApp);
 
   // ── Documentos Firestore ──────────────────────────────────
   // pos/terraza          → estado general
-  // pos/inventory        → inventario sin imágenes
+  // pos/inventory        → inventario sin imágenes (solo URLs)
   // pos/currentOrder     → pedido activo
-  // product_images/{id}  → una imagen por producto (colección separada)
+  // product_images/{id}  → URL de imagen por producto (Firestore, pequeño)
+  // Firebase Storage: product_images/{id}.jpg → archivo real de imagen
   const STATE_DOC   = doc(db, "pos", "terraza");
   const INV_DOC     = doc(db, "pos", "inventory");
   const ORDER_DOC   = doc(db, "pos", "currentOrder");
@@ -46,24 +50,24 @@
   let _writingInv   = false;
   let _writingOrder = false;
 
-  // ── Caché local: String(productId) → base64 ───────────────
+  // ── Caché local: String(productId) → URL pública o base64 ─
   let _imagesCache = {};
 
-  // ── Comprimir imagen (máx 320px, JPEG 0.70) ───────────────
+  // ── Comprimir imagen (máx 800px, JPEG 0.82) — mayor calidad con Storage ──
   function compressImage(base64) {
     return new Promise(resolve => {
       if (!base64) { resolve(null); return; }
       const imgEl = new Image();
       imgEl.onload = () => {
         const canvas = document.createElement('canvas');
-        let w = imgEl.width, h = imgEl.height, ms = 320;
+        let w = imgEl.width, h = imgEl.height, ms = 800;
         if (w > ms || h > ms) {
           if (w > h) { h = Math.round(h * ms / w); w = ms; }
           else       { w = Math.round(w * ms / h); h = ms; }
         }
         canvas.width = w; canvas.height = h;
         canvas.getContext('2d').drawImage(imgEl, 0, 0, w, h);
-        resolve(canvas.toDataURL('image/jpeg', 0.70));
+        resolve(canvas.toDataURL('image/jpeg', 0.82));
       };
       imgEl.onerror = () => resolve(base64);
       imgEl.src = base64;
@@ -78,22 +82,45 @@
     if (_writingInv) return;
     _writingInv = true;
     try {
-      const items = (inventory || []).map(i => ({ ...i, img: null }));
+      // Guardar solo la URL de imagen (no el base64 pesado)
+      const items = (inventory || []).map(i => {
+        const cached = _imagesCache[String(i.id)];
+        // Si la URL cacheada es una URL pública (http), guardarla; si es base64 omitirla
+        const imgUrl = (cached && cached.startsWith('http')) ? cached : null;
+        return { ...i, img: imgUrl };
+      });
       await setDoc(INV_DOC, { items, _updatedAt: serverTimestamp() });
     } catch (e) { console.warn('[Firebase] Error guardando inventario:', e); }
     finally { _writingInv = false; }
   }
 
-  // Guarda la imagen de UN producto en product_images/{id}
+  // ── Sube imagen a Firebase Storage y guarda la URL en Firestore ──
   async function fbSaveImage(productId, base64) {
     if (!productId || !base64) return;
     try {
+      // 1. Comprimir
       const compressed = await compressImage(base64);
-      const imgRef = doc(db, "product_images", String(productId));
-      await setDoc(imgRef, { img: compressed, _updatedAt: serverTimestamp() });
-      _imagesCache[String(productId)] = compressed;
-      console.log('[Firebase] ✅ Imagen sincronizada, producto', productId);
-    } catch (e) { console.warn('[Firebase] Error guardando imagen producto ' + productId + ':', e); }
+
+      // 2. Subir a Firebase Storage como archivo JPEG
+      const imgPath = `product_images/${String(productId)}.jpg`;
+      const fileRef = storageRef(storage, imgPath);
+      await uploadString(fileRef, compressed, 'data_url');
+
+      // 3. Obtener URL pública permanente
+      const downloadURL = await getDownloadURL(fileRef);
+
+      // 4. Guardar URL en Firestore (documento liviano)
+      const imgDocRef = doc(db, "product_images", String(productId));
+      await setDoc(imgDocRef, { url: downloadURL, _updatedAt: serverTimestamp() });
+
+      // 5. Actualizar caché local con la URL pública
+      _imagesCache[String(productId)] = downloadURL;
+      console.log('[Firebase Storage] ✅ Imagen subida, producto', productId, '→', downloadURL);
+    } catch (e) {
+      console.warn('[Firebase Storage] Error subiendo imagen producto ' + productId + ':', e);
+      // Fallback: guardar base64 en caché local para que se vea en pantalla aunque no se subió
+      _imagesCache[String(productId)] = base64;
+    }
   }
 
   async function fbSaveState(stateObj, currentOrderObj) {
@@ -116,13 +143,15 @@
   // CARGAR (primera vez)
   // ══════════════════════════════════════════════
 
-  // Descarga TODAS las imágenes de la colección y llena _imagesCache
+  // Descarga todas las URLs de imágenes de Firestore y llena _imagesCache
   async function fbLoadImages() {
     try {
       const snap = await getDocs(IMAGES_COL);
       snap.forEach(d => {
         const data = d.data();
-        if (data.img) _imagesCache[d.id] = data.img;
+        // Soporta tanto 'url' (Storage) como 'img' (base64 legado)
+        const src = data.url || data.img || null;
+        if (src) _imagesCache[d.id] = src;
       });
       console.log('[Firebase] Imágenes cargadas:', Object.keys(_imagesCache).length);
       return _imagesCache;
@@ -134,7 +163,10 @@
       const snap = await getDoc(INV_DOC);
       if (!snap.exists()) return null;
       const data = snap.data();
-      return (data.items || []).map(i => ({ ...i, img: _imagesCache[String(i.id)] || null }));
+      return (data.items || []).map(i => ({
+        ...i,
+        img: _imagesCache[String(i.id)] || i.img || null
+      }));
     } catch (e) { console.warn('[Firebase] Error cargando inventario:', e); return null; }
   }
 
@@ -167,7 +199,7 @@
   let _unsubImages = null;
 
   function fbStartRealtime() {
-    // ── Imágenes: escucha la colección completa ────────────
+    // ── Imágenes: escucha la colección (URLs, no base64) ──────
     if (_unsubImages) _unsubImages();
     _unsubImages = onSnapshot(IMAGES_COL, snap => {
       snap.docChanges().forEach(change => {
@@ -175,7 +207,8 @@
           delete _imagesCache[change.doc.id];
         } else {
           const d = change.doc.data();
-          if (d.img) _imagesCache[change.doc.id] = d.img;
+          const src = d.url || d.img || null;
+          if (src) _imagesCache[change.doc.id] = src;
         }
       });
       if (typeof window._posApplyImages === 'function') {
@@ -189,7 +222,10 @@
       if (!snap.exists() || _writingInv) return;
       const data = snap.data();
       if (!data || !data.items) return;
-      const items = (data.items || []).map(i => ({ ...i, img: _imagesCache[String(i.id)] || null }));
+      const items = (data.items || []).map(i => ({
+        ...i,
+        img: _imagesCache[String(i.id)] || i.img || null
+      }));
       if (typeof window._posApplyInventory === 'function') {
         window._posApplyInventory(items);
       }
@@ -199,7 +235,6 @@
     if (_unsubState) _unsubState();
     _unsubState = onSnapshot(STATE_DOC, snap => {
       if (!snap.exists()) return;
-      // Solo ignorar el eco local inmediato (mientras se está escribiendo activamente)
       if (_writingState) return;
       const data = snap.data();
       delete data._updatedAt;
@@ -1809,12 +1844,12 @@ window._posApplyInventory = function(items) {
   }
 };
 
-// Imágenes: cuando otro usuario sube/cambia una imagen
+// Imágenes: cuando otro usuario sube/cambia una imagen (ahora son URLs de Storage)
 window._posApplyImages = function(imagesCache) {
   if (!imagesCache) return;
   let changed = false;
   state.inventory = (state.inventory || []).map(item => {
-    const remoteImg = imagesCache[item.id];
+    const remoteImg = imagesCache[String(item.id)];
     if (remoteImg && remoteImg !== item.img) {
       changed = true;
       return { ...item, img: remoteImg };
