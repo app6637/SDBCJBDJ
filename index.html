@@ -1550,7 +1550,8 @@ main { padding-top: 50px; }
     <!-- Sección Recaudos -->
     <div style="font-family:'Barlow Condensed',sans-serif;font-size:.82rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--text-muted);margin-bottom:8px;">💵 PAGOS RECIBIDOS</div>
     <div id="camRecaudosList" style="max-height:160px;overflow-y:auto;display:flex;flex-direction:column;gap:5px;"></div>
-    <div class="modal-actions" style="justify-content:flex-end;margin-top:16px;">
+    <div class="modal-actions" style="justify-content:space-between;margin-top:16px;">
+      <button class="btn btn-primary" style="gap:6px;" onclick="if(_openClientAccountId)printClientAccount(_openClientAccountId)">🖨️ IMPRIMIR</button>
       <button class="btn btn-secondary" onclick="closeClientAccountModal()">Cerrar</button>
     </div>
   </div>
@@ -2141,7 +2142,10 @@ function renderMisClientes() {
       <td style="color:var(--gold);font-weight:700;">${fmt(totalVentas)}</td>
       <td style="color:var(--green);font-weight:600;">${fmt(recaudado)}</td>
       <td style="${pendClass};font-weight:700;">${pendiente > 0 ? fmt(pendiente) : '✔ Al día'}</td>
-      <td><button class="btn btn-info" style="font-size:.75rem;padding:5px 8px;" onclick="showClientAccount(${c.id})">📊 Ver</button></td>
+      <td style="display:flex;gap:6px;">
+        <button class="btn btn-info" style="font-size:.75rem;padding:5px 8px;" onclick="showClientAccount(${c.id})">📊 Ver</button>
+        <button class="btn btn-secondary" style="font-size:.75rem;padding:5px 8px;" onclick="printClientAccount(${c.id})">🖨️</button>
+      </td>
     </tr>`;
   }).join('');
 }
@@ -3036,6 +3040,7 @@ function renderClientes() {
       <td style="${pendClass};font-weight:700;">${pendiente > 0 ? fmt(pendiente) : '✔ Al día'}</td>
       <td style="display:flex;gap:6px;flex-wrap:wrap;">
         <button class="btn btn-info" style="font-size:.75rem;padding:5px 8px;" onclick="showClientAccount(${c.id})">📊 Ver</button>
+        <button class="btn btn-secondary" style="font-size:.75rem;padding:5px 8px;" onclick="printClientAccount(${c.id})">🖨️</button>
         <button class="btn btn-danger" style="font-size:.75rem;padding:5px 8px;" onclick="deleteCustomer(${c.id})">🗑️</button>
       </td>
     </tr>`;
@@ -3133,6 +3138,106 @@ function _refreshClientAccountModal() {
 function closeClientAccountModal() {
   _openClientAccountId = null;
   closeModal('clientAccountModal');
+}
+
+function printClientAccount(clientId) {
+  const data = getClientAccountData(clientId);
+  if (!data) { notify('Cliente no encontrado', 'error'); return; }
+  const { c, cOrders, totalVentas, recaudado, pendiente } = data;
+  const recaudos = (state.recaudos || []).filter(r => r.customerId === clientId);
+  const now = new Date().toLocaleString('es-CO');
+
+  const css = `
+    @import url('https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;700&display=swap');
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Roboto Mono', 'Courier New', monospace;
+      font-size: 14px; color: #000; background: #fff;
+      -webkit-print-color-adjust: exact; print-color-adjust: exact;
+    }
+    .page { width: 72mm; margin: 0 auto; padding: 8px 6px; }
+    .biz-name { text-align: center; font-size: 19px; font-weight: 700;
+      letter-spacing: 1px; text-transform: uppercase; margin-bottom: 2px; }
+    .subtitle { text-align: center; font-size: 12px; color: #333; margin-bottom: 6px; }
+    .divider { border: none; border-top: 2px dashed #000; margin: 7px 0; }
+    .divider-solid { border: none; border-top: 1px solid #000; margin: 5px 0; }
+    .section { font-size: 12px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 1px; margin: 6px 0 3px; }
+    .info-line { font-size: 13px; margin-bottom: 3px; }
+    .row { display: flex; justify-content: space-between; font-size: 13px; padding: 2px 0; }
+    .row.bold { font-weight: 700; }
+    .row.red  { color: #c0392b; font-weight: 700; }
+    .row.green { color: #27ae60; font-weight: 700; }
+    .summary-box { border: 2px solid #000; padding: 6px 8px; margin: 7px 0; }
+    .summary-box .label { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #555; }
+    .summary-box .value { font-size: 17px; font-weight: 700; }
+    .pending-banner { border: 2px solid #c0392b; padding: 6px 8px; margin: 7px 0; text-align: center; }
+    .ok-banner { border: 2px solid #27ae60; padding: 6px 8px; margin: 7px 0; text-align: center; }
+    .order-block { font-size: 12px; margin-bottom: 5px; padding-bottom: 4px; border-bottom: 1px dashed #ccc; }
+    .order-header { display: flex; justify-content: space-between; font-weight: 700; margin-bottom: 2px; }
+    .order-item { padding-left: 6px; display: flex; justify-content: space-between; }
+    .payment-row { font-size: 12px; padding: 2px 0; }
+    .thanks { text-align: center; font-size: 12px; margin-top: 10px; font-weight: 700; letter-spacing: 1px; }
+    .date-line { text-align: center; font-size: 11px; color: #555; margin-bottom: 4px; }
+    @media print { body { font-size: 14px; } .page { padding: 4px 4px; } }
+  `;
+
+  const pendState = pendiente > 0
+    ? `<div class="pending-banner">⚠ SALDO PENDIENTE: <strong>${fmt(pendiente)}</strong></div>`
+    : `<div class="ok-banner">✔ CUENTA AL DIA. SIN PENDIENTES.</div>`;
+
+  const ordersHtml = cOrders.length
+    ? [...cOrders].reverse().map(o => `
+        <div class="order-block">
+          <div class="order-header">
+            <span>#${o.id} — ${o.waiterName}</span>
+            <span>${fmt(o.total)}</span>
+          </div>
+          <div style="font-size:11px;color:#555;margin-bottom:2px;">${o.date}</div>
+          ${o.items.map(it => `<div class="order-item"><span>${it.name} ×${it.qty}</span><span>${fmt(it.price * it.qty)}</span></div>`).join('')}
+        </div>`).join('')
+    : '<div style="font-size:12px;color:#555;text-align:center;padding:6px 0;">Sin pedidos registrados</div>';
+
+  const paymentsHtml = recaudos.length
+    ? [...recaudos].reverse().map(r => `
+        <div class="payment-row" style="display:flex;justify-content:space-between;">
+          <span>${r.date || r.fecha || ''} · ${r.tipo === 'efectivo' ? 'Efectivo' : 'Transf.'}</span>
+          <span style="font-weight:700;">${fmt(r.monto)}</span>
+        </div>`).join('')
+    : '<div style="font-size:12px;color:#555;text-align:center;padding:6px 0;">Sin pagos registrados</div>';
+
+  const accountBlock = `
+    <div class="page">
+      <div class="biz-name">TERRAZA LOS CADENAS</div>
+      <div class="subtitle">ESTADO DE CUENTA — CLIENTE</div>
+      <div class="date-line">${now}</div>
+      <hr class="divider">
+      <div class="info-line"><b>Cliente:</b> ${c.name}</div>
+      ${c.contact ? `<div class="info-line"><b>Contacto:</b> ${c.contact}</div>` : ''}
+      <div class="info-line"><b>Código:</b> ${c.clientCode || '—'}</div>
+      <hr class="divider">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:6px;">
+        <div class="summary-box"><div class="label">Pedidos</div><div class="value">${cOrders.length}</div></div>
+        <div class="summary-box"><div class="label">Total Consumo</div><div class="value">${fmt(totalVentas)}</div></div>
+        <div class="summary-box"><div class="label">Pagado</div><div class="value" style="color:#27ae60;">${fmt(recaudado)}</div></div>
+        <div class="summary-box"><div class="label">Pendiente</div><div class="value" style="color:${pendiente > 0 ? '#c0392b' : '#27ae60'};">${pendiente > 0 ? fmt(pendiente) : 'Al día'}</div></div>
+      </div>
+      ${pendState}
+      <hr class="divider">
+      <div class="section">📋 Pedidos</div>
+      ${ordersHtml}
+      <hr class="divider">
+      <div class="section">💵 Pagos Recibidos</div>
+      ${paymentsHtml}
+      <hr class="divider">
+      <div class="thanks">TERRAZA LOS CADENAS</div>
+    </div>
+  `;
+
+  const html = `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8">
+    <title>Estado de Cuenta — ${c.name}</title>
+    <style>${css}</style></head><body>${accountBlock}</body></html>`;
+  openPrint(html);
 }
 
 // Polling de respaldo: refresca el modal cada 3 segundos
