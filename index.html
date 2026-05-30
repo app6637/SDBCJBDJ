@@ -2585,8 +2585,10 @@ function dispatchOrder() {
     });
   }
 
-  // Imprimir factura
-  printInvoice(order);
+  // Imprimir factura — solo admin puede imprimir (no meseros)
+  if (!currentWaiterSession) {
+    printInvoice(order);
+  }
 
   currentOrder.items = [];
   currentOrder.customerId = null;
